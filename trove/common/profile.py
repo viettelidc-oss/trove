@@ -16,6 +16,7 @@
 from oslo_context import context
 from oslo_log import log as logging
 import oslo_messaging as messaging
+import osprofiler.initializer
 from osprofiler import notifier
 from osprofiler import web
 
@@ -29,6 +30,15 @@ CONF = cfg.CONF
 
 def setup_profiler(binary, host):
     if CONF.profiler.enabled:
+        # _notifier = notifier.create(
+        #     "Messaging", messaging, context.get_admin_context().to_dict(),
+        #     rpc.TRANSPORT, "trove", binary, host)
+        # notifier.set(_notifier)
+        osprofiler.initializer.init_from_conf(conf=CONF,
+                                              context=context.get_admin_context().to_dict(),
+                                              project="trove",
+                                              service=binary,
+                                              host=host)
         _notifier = notifier.create(
             "Messaging", messaging, context.get_admin_context().to_dict(),
             rpc.TRANSPORT, "trove", binary, host)

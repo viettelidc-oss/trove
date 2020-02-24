@@ -139,7 +139,7 @@ def load_simple_instance_server_status(context, db_info):
 
 
 # Invalid states to contact the agent
-AGENT_INVALID_STATUSES = ["BUILD", "REBOOT", "RESIZE", "PROMOTE", "EJECT",
+AGENT_INVALID_STATUSES = ["ERROR", "SHUTDOWN", "BUILD", "REBOOT", "RESIZE", "PROMOTE", "EJECT",
                           "UPGRADE"]
 
 

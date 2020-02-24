@@ -24,6 +24,7 @@ trove.iml
 .pid
 .stestr/
 
+.idea/
 # Sphinx
 doc/build/*
 doc/source/api/*
