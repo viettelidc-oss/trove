@@ -417,7 +417,7 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
             if self.volume_id:
                 volume_client = create_cinder_client(self.context)
                 volume = volume_client.volumes.get(self.volume_id)
-                if volume.status == "available":
+                if volume.status in ["available", "error"]:
                     LOG.info("Deleting volume %(v)s for instance: %(i)s.",
                              {'v': self.volume_id, 'i': self.id})
                     volume.delete()
@@ -1075,7 +1075,7 @@ class BuiltInstanceTasks(BuiltInstance, NotifyMixin, ConfigurationMixin):
                 volume_client = create_cinder_client(self.context,
                                                      self.region_name)
                 volume = volume_client.volumes.get(self.volume_id)
-                if volume.status == "available":
+                if volume.status in ["available", "error"]:
                     LOG.info("Deleting volume %(v)s for instance: %(i)s.",
                              {'v': self.volume_id, 'i': self.id})
                     volume.delete()
