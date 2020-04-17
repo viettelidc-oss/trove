@@ -417,7 +417,7 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
             if self.volume_id:
                 volume_client = create_cinder_client(self.context)
                 volume = volume_client.volumes.get(self.volume_id)
-                if volume.status == "available":
+                if volume.status in ["available", "error"]:
                     LOG.info("Deleting volume %(v)s for instance: %(i)s.",
                              {'v': self.volume_id, 'i': self.id})
                     volume.delete()
@@ -991,6 +991,9 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
         cidr = CONF.trove_security_group_rule_cidr
         private_cidr = CONF.trove_security_group_private_rule_cidr
         private_tcp_port = CONF.private_tcp_ports
+        private_tcp_port_list = []
+        for private_port in set(private_tcp_port):
+            private_tcp_port_list.append(private_port[0])
 
         if protocol == 'icmp':
             SecurityGroupRule.create_sec_group_rule(
@@ -1001,7 +1004,7 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
                 try:
                     from_, to_ = (None, None)
                     from_, to_ = port_or_range[0], port_or_range[-1]
-                    if int(from_) in private_tcp_port:
+                    if int(from_) in private_tcp_port_list:
                         SecurityGroupRule.create_sec_group_rule(
                             s_group, protocol, int(from_), int(to_),
                             private_cidr, self.context, self.region_name)
@@ -1082,7 +1085,7 @@ class BuiltInstanceTasks(BuiltInstance, NotifyMixin, ConfigurationMixin):
                 volume_client = create_cinder_client(self.context,
                                                      self.region_name)
                 volume = volume_client.volumes.get(self.volume_id)
-                if volume.status == "available":
+                if volume.status in ["available", "error"]:
                     LOG.info("Deleting volume %(v)s for instance: %(i)s.",
                              {'v': self.volume_id, 'i': self.id})
                     volume.delete()

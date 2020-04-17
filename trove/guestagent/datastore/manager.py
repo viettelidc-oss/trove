@@ -141,8 +141,7 @@ class Manager(periodic_task.PeriodicTasks):
         """
         return None
 
-    @property
-    def datastore_log_defs(self):
+    def get_datastore_log_defs(self):
         """Any datastore-specific log files should be overridden in this dict
         by the corresponding Manager class.
 
@@ -181,11 +180,10 @@ class Manager(periodic_task.PeriodicTasks):
             },
         }
 
-    @property
-    def guest_log_defs(self):
+    def get_guest_log_defs(self):
         """Return all the guest log defs."""
         if not self._guest_log_defs:
-            self._guest_log_defs = dict(self.datastore_log_defs)
+            self._guest_log_defs = dict(self.get_datastore_log_defs())
             self._guest_log_defs.update(self.guestagent_log_defs)
         return self._guest_log_defs
 
@@ -197,8 +195,7 @@ class Manager(periodic_task.PeriodicTasks):
     def guest_log_context(self, context):
         self._guest_log_context = context
 
-    @property
-    def guest_log_cache(self):
+    def get_guest_log_cache(self):
         """Make sure the guest_log_cache is loaded and return it."""
         self._refresh_guest_log_cache()
         return self._guest_log_cache
@@ -214,7 +211,7 @@ class Manager(periodic_task.PeriodicTasks):
             # Load the initial cache
             self._guest_log_cache = {}
             if self.guest_log_context:
-                gl_defs = self.guest_log_defs
+                gl_defs = self.get_guest_log_defs()
                 try:
                     exposed_logs = CONF.get(self.manager).get(
                         'guest_log_exposed_logs')
@@ -474,7 +471,7 @@ class Manager(periodic_task.PeriodicTasks):
     def guest_log_list(self, context):
         LOG.info("Getting list of guest logs.")
         self.guest_log_context = context
-        gl_cache = self.guest_log_cache
+        gl_cache = self.get_guest_log_cache()
         result = filter(None, [gl_cache[log_name].show()
                                if gl_cache[log_name].exposed else None
                                for log_name in gl_cache.keys()])
@@ -495,7 +492,7 @@ class Manager(periodic_task.PeriodicTasks):
                  {'log': log_name, 'en': enable, 'dis': disable,
                   'pub': publish, 'disc': discard})
         self.guest_log_context = context
-        gl_cache = self.guest_log_cache
+        gl_cache = self.get_guest_log_cache()
         if log_name in gl_cache:
             if ((gl_cache[log_name].type == guest_log.LogType.SYS) and
                     not publish):
@@ -541,7 +538,7 @@ class Manager(periodic_task.PeriodicTasks):
         if self.configuration_manager:
             LOG.debug("%(verb)s log '%(log)s'", {'verb': verb,
                                                  'log': log_name})
-            gl_def = self.guest_log_defs[log_name]
+            gl_def = self.get_guest_log_defs()[log_name]
             enable_cfg_label = "%s_%s_log" % (self.GUEST_LOG_ENABLE_LABEL,
                                               log_name)
             disable_cfg_label = "%s_%s_log" % (self.GUEST_LOG_DISABLE_LABEL,
@@ -592,7 +589,7 @@ class Manager(periodic_task.PeriodicTasks):
         """Sets the status of log_name to 'status' - if log_name is not
         provided, sets the status on all logs.
         """
-        gl_cache = self.guest_log_cache
+        gl_cache = self.get_guest_log_cache()
         names = [log_name]
         if not log_name or log_name not in gl_cache:
             names = gl_cache.keys()

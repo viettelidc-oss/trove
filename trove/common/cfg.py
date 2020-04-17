@@ -279,7 +279,7 @@ common_opts = [
                help='Prefix to use when creating Security Groups.'),
     cfg.StrOpt('trove_security_group_rule_cidr', default='0.0.0.0/0',
                help='CIDR to use when creating Security Group Rules.'),
-    cfg.ListOpt('private_tcp_ports', default=[1111], item_type=ListOfPortsType,
+    cfg.ListOpt('private_tcp_ports', default=["1111","9999"], item_type=ListOfPortsType,
                 help='List of Private TCP ports and/or port ranges to open '),
     cfg.StrOpt('trove_security_group_private_rule_cidr', default='192.168.10.0/24',
                help='CIDR to use when creating Private Security Group Rules.'),
