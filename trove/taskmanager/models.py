@@ -989,6 +989,8 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
             raise MalformedSecurityGroupRuleError(message=msg)
 
         cidr = CONF.trove_security_group_rule_cidr
+        private_cidr = CONF.trove_security_group_private_rule_cidr
+        private_tcp_port = CONF.private_tcp_ports
 
         if protocol == 'icmp':
             SecurityGroupRule.create_sec_group_rule(
@@ -999,9 +1001,14 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
                 try:
                     from_, to_ = (None, None)
                     from_, to_ = port_or_range[0], port_or_range[-1]
-                    SecurityGroupRule.create_sec_group_rule(
-                        s_group, protocol, int(from_), int(to_),
-                        cidr, self.context, self.region_name)
+                    if int(from_) in private_tcp_port:
+                        SecurityGroupRule.create_sec_group_rule(
+                            s_group, protocol, int(from_), int(to_),
+                            private_cidr, self.context, self.region_name)
+                    else:
+                        SecurityGroupRule.create_sec_group_rule(
+                            s_group, protocol, int(from_), int(to_),
+                            cidr, self.context, self.region_name)
                 except (ValueError, TroveError):
                     set_error_and_raise([from_, to_])
 
