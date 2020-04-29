@@ -995,6 +995,13 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
         for private_port in set(private_tcp_port):
             private_tcp_port_list.append(private_port[0])
 
+        # Set private security_group for monitoring service
+        private_2_cidr = CONF.trove_security_group_private_2_rule_cidr
+        private_2_tcp_port = CONF.private_2_tcp_ports
+        private_2_tcp_port_list = []
+        for private_2_port in set(private_2_tcp_port):
+            private_2_tcp_port_list.append(private_2_port[0])
+
         if protocol == 'icmp':
             SecurityGroupRule.create_sec_group_rule(
                 s_group, 'icmp', None, None,
@@ -1008,6 +1015,10 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
                         SecurityGroupRule.create_sec_group_rule(
                             s_group, protocol, int(from_), int(to_),
                             private_cidr, self.context, self.region_name)
+                    elif int(from_) in private_2_tcp_port_list:
+                        SecurityGroupRule.create_sec_group_rule(
+                            s_group, protocol, int(from_), int(to_),
+                            private_2_cidr, self.context, self.region_name)
                     else:
                         SecurityGroupRule.create_sec_group_rule(
                             s_group, protocol, int(from_), int(to_),
