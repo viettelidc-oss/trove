@@ -64,7 +64,7 @@ class RedisClusterTasks(task_models.ClusterTasks):
             try:
                 cluster_head = instances[0]
                 cluster_head_port = '6379'
-                cluster_head_ip = self.get_ip(cluster_head)
+                cluster_head_ip = self.get_private_ip(cluster_head)
                 for guest in guests[1:]:
                     guest.cluster_meet(cluster_head_ip, cluster_head_port)
 

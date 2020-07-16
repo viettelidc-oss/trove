@@ -97,7 +97,7 @@ class MongoDbClusterTasks(task_models.ClusterTasks):
             # for config_server in config_servers, append ip/hostname to
             # "config_server_hosts", then
             # peel off the replica-set name and ip/hostname from 'x'
-            config_server_ips = [self.get_ip(instance)
+            config_server_ips = [self.get_private_ip(instance)
                                  for instance in config_servers]
             LOG.debug("config server ips: %s", config_server_ips)
 
@@ -229,7 +229,7 @@ class MongoDbClusterTasks(task_models.ClusterTasks):
                 query_routers = [Instance.load(context, instance_id)
                                  for instance_id in query_router_ids]
                 config_servers_ips = [
-                    self.get_ip(Instance.load(context, config_server_id))
+                    self.get_private_ip(Instance.load(context, config_server_id))
                     for config_server_id in config_servers_ids
                 ]
                 if not self._add_query_routers(
@@ -308,7 +308,7 @@ class MongoDbClusterTasks(task_models.ClusterTasks):
         other_members_ips = []
         try:
             for member in other_members:
-                other_members_ips.append(self.get_ip(member))
+                other_members_ips.append(self.get_private_ip(member))
                 self.get_guest(member).restart()
             self.get_guest(primary_member).prep_primary()
             self.get_guest(primary_member).add_members(other_members_ips)
@@ -334,7 +334,7 @@ class MongoDbClusterTasks(task_models.ClusterTasks):
                    'shard_id': primary_member.shard_id, 'cluster_id': self.id})
         try:
             self.get_guest(query_router).add_shard(
-                replica_set, self.get_ip(primary_member))
+                replica_set, self.get_private_ip(primary_member))
         except Exception:
             LOG.exception("error adding shard")
             self.update_statuses_on_failure(self.id,

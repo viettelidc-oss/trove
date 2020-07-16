@@ -223,6 +223,17 @@ class SimpleInstance(object):
     def hostname(self):
         return self.db_info.hostname
 
+    def get_private_ip_addresses(self):
+        """Returns IPs that will be visible to the user."""
+        if self.addresses is None:
+            return None
+        privateIPs = []
+        mgmt_networks = neutron.get_management_networks(self.context)
+        for label in self.addresses:
+            if label in mgmt_networks:
+                privateIPs.extend([addr.get('addr') for addr in self.addresses[label]])
+        return privateIPs
+
     def get_visible_ip_addresses(self):
         """Returns IPs that will be visible to the user."""
         if self.addresses is None:

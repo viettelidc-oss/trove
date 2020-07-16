@@ -131,7 +131,7 @@ class CassandraClusterTasks(task_models.ClusterTasks):
         return {'instance': instance,
                 'guest': guest,
                 'id': instance.id,
-                'ip': cls.get_ip(instance),
+                'ip': cls.get_private_ip(instance),
                 'dc': guest.get_data_center(),
                 'rack': guest.get_rack()}
 
