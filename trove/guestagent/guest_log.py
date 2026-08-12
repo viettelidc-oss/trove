@@ -15,6 +15,7 @@
 import enum
 import hashlib
 import os
+from pathlib import Path
 from requests.exceptions import ConnectionError
 
 from oslo_log import log as logging
@@ -215,7 +216,6 @@ class GuestLog(object):
             raise exception.LogAccessForbidden(action='show', log=self._name)
 
     def _refresh_details(self):
-
         if self._published_size is None:
             # Initializing, so get all the values
             try:
@@ -246,42 +246,38 @@ class GuestLog(object):
                    'published': self._published_size})
 
     def _update_details(self):
-        # Make sure we can read the file
-        if not self._file_readable or not os.access(self._file, os.R_OK):
-            if not os.access(self._file, os.R_OK):
-                if operating_system.exists(self._file, as_root=True):
-                    operating_system.chmod(
-                        self._file, FileMode.ADD_ALL_R, as_root=True)
-            self._file_readable = True
+        if operating_system.exists(self._file, as_root=True):
+            file_path = Path(self._file)
 
-        if os.path.isfile(self._file):
-            logstat = os.stat(self._file)
-            self._size = logstat.st_size
+            # Make sure guest agent can read the log file.
+            if not os.access(self._file, os.R_OK):
+                operating_system.chmod(self._file, FileMode.ADD_ALL_R,
+                                       as_root=True)
+                operating_system.chmod(str(file_path.parent),
+                                       FileMode.ADD_GRP_RX_OTH_RX,
+                                       as_root=True)
+
+            self._size = file_path.stat().st_size
             self._update_log_header_digest(self._file)
 
-            if self._log_rotated():
-                self.status = LogStatus.Rotated
-            # See if we have stuff to publish
-            elif logstat.st_size > self._published_size:
-                self._set_status(self._published_size,
-                                 LogStatus.Partial, LogStatus.Ready)
-            # We've published everything so far
-            elif logstat.st_size == self._published_size:
-                self._set_status(self._published_size,
-                                 LogStatus.Published, LogStatus.Enabled)
-            # We've already handled this case (log rotated) so what gives?
-            else:
-                raise Exception(_("Bug in _log_rotated ?"))
+            if self.status != LogStatus.Disabled:
+                if self._log_rotated():
+                    self.status = LogStatus.Rotated
+                # See if we have stuff to publish
+                elif self._size > self._published_size:
+                    self._set_status(self._published_size,
+                                     LogStatus.Partial, LogStatus.Ready)
+                # We've published everything so far
+                elif self._size == self._published_size:
+                    self._set_status(self._published_size,
+                                     LogStatus.Published, LogStatus.Enabled)
+                # We've already handled this case (log rotated) so what gives?
+                else:
+                    raise Exception(_("Bug in _log_rotated ?"))
         else:
+            LOG.warning(f"File {self._file} does not exist")
             self._published_size = 0
             self._size = 0
-
-        if not self._size or not self.enabled:
-            user_status = LogStatus.Disabled
-            if self.enabled:
-                user_status = LogStatus.Enabled
-            self._set_status(self._type == LogType.USER,
-                             user_status, LogStatus.Unavailable)
 
     def _log_rotated(self):
         """If the file is smaller than the last reported size
@@ -295,7 +291,8 @@ class GuestLog(object):
 
     def _update_log_header_digest(self, log_file):
         with open(log_file, 'rb') as log:
-            self._header_digest = hashlib.md5(log.readline()).hexdigest()
+            self._header_digest = hashlib.md5(
+                log.readline(), usedforsecurity=False).hexdigest()
 
     def _get_headers(self):
         return {'X-Delete-After': str(CONF.guest_log_expiry)}
@@ -306,7 +303,7 @@ class GuestLog(object):
                 LOG.debug("Log file rotation detected for '%s' - "
                           "discarding old log", self._name)
                 self._delete_log_components()
-            if os.path.isfile(self._file):
+            if operating_system.exists(self._file, as_root=True):
                 self._publish_to_container(self._file)
             else:
                 raise RuntimeError(_(
@@ -334,8 +331,6 @@ class GuestLog(object):
         swift_files.append(self._metafile_name())
         for swift_file in swift_files:
             self.swift_client.delete_object(container_name, swift_file)
-        self._set_status(self._type == LogType.USER,
-                         LogStatus.Disabled, LogStatus.Enabled)
         self._published_size = 0
 
     def _publish_to_container(self, log_filename):

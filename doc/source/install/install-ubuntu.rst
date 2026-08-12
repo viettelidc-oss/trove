@@ -4,7 +4,7 @@ Install and configure for Ubuntu
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 This section describes how to install and configure the Database
-service for Ubuntu 14.04 (LTS).
+service for Ubuntu Ubuntu 22.04 or 24.04 (LTS).
 
 .. include:: common_prerequisites.txt
 
@@ -14,13 +14,22 @@ Install and configure components
 
 #. Install the packages:
 
+   .. warning::
+
+       Please be aware that the trove debian packages for Ubuntu are not
+       usually up to date, especially when there are bugfixes for stable
+       branch, the debian packages are not guaranteed to contain those changes.
+       The recommended way to install OpenStack services is either using docker
+       image with source code or installing source code inside a Python
+       virutual environment.
+
+   The commands to install Trove compoments:
+
    .. code-block:: console
 
-      # apt-get update
-
-      # apt-get install python-trove python-troveclient \
-        python-glanceclient trove-common trove-api trove-taskmanager \
-        trove-conductor
+      # apt update
+      # apt install python-trove trove-common trove-api trove-taskmanager trove-conductor
+      # pip3 install python-troveclient
 
 
 .. include:: common_configure.txt
@@ -29,39 +38,7 @@ Install and configure components
 Finalize installation
 ---------------------
 
-1. Due to a bug in the Ubuntu packages, edit the service definition files
-   to use the correct configuration settings.
-
-   To do this, navigate to ``/etc/init`` and edit the following files
-   as described below:
-
-   ``trove-taskmanager.conf``
-
-   ``trove-conductor.conf``
-
-   (Note that, although they have the same names, these files are
-   in a different location and have different content than the similarly
-   named files you edited earlier in this procedure.)
-
-   In each file, find this line:
-
-   .. code-block:: ini
-
-      exec start-stop-daemon --start --chdir /var/lib/trove \
-         --chuid trove:trove --make-pidfile \
-         --pidfile /var/run/trove/trove-conductor.pid \
-         --exec /usr/bin/trove-conductor -- \
-         --config-file=/etc/trove/trove.conf ${DAEMON_ARGS}
-
-   Note that ``--config-file`` incorrectly points to ``trove.conf``.
-
-   In ``trove-taskmanager.conf``, edit ``config-file`` to point to
-   ``/etc/trove/trove-taskmanager.conf``.
-
-   In ``trove-conductor.conf``, edit ``config-file`` to point to
-   ``/etc/trove/trove-conductor.conf``.
-
-2. Restart the Database services:
+1. Restart the Database services:
 
    .. code-block:: console
 

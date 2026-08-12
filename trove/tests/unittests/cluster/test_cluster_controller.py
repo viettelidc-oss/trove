@@ -15,9 +15,9 @@
 #
 import jsonschema
 
-from mock import MagicMock
-from mock import Mock
-from mock import patch
+from unittest.mock import MagicMock
+from unittest.mock import Mock
+from unittest.mock import patch
 from testtools.matchers import Is, Equals
 from trove.cluster import models
 from trove.cluster.models import Cluster, DBCluster
@@ -162,7 +162,7 @@ class TestClusterController(trove_testtools.TestCase):
         error_messages = [error.message for error in errors]
         error_paths = [error.path.pop() for error in errors]
         self.assertThat(len(errors), Is(2))
-        self.assertIn("'' is too short", error_messages)
+        self.assertIn("'' should be non-empty", error_messages)
         self.assertIn("'' does not match '^.*[0-9a-zA-Z]+.*$'", error_messages)
         self.assertIn("type", error_paths)
 
@@ -244,7 +244,7 @@ class TestClusterController(trove_testtools.TestCase):
         mock_cluster_create.assert_called_with(context, 'products',
                                                datastore, datastore_version,
                                                instances, {},
-                                               self.locality, None)
+                                               self.locality, None, None)
 
     @patch.object(Cluster, 'load')
     def test_show_cluster(self,

@@ -13,8 +13,8 @@
 
 import datetime
 
-from mock import Mock
-from mock import patch
+from unittest.mock import Mock
+from unittest.mock import patch
 
 from trove.cluster.models import ClusterTasks as ClusterTaskStatus
 from trove.cluster.models import DBCluster
@@ -32,8 +32,8 @@ from trove.instance.models import DBInstance
 from trove.instance.models import Instance
 from trove.instance.models import InstanceServiceStatus
 from trove.instance.models import InstanceTasks
+from trove.instance.service_status import ServiceStatuses
 from trove import rpc
-from trove.taskmanager.models import ServiceStatuses
 from trove.tests.unittests import trove_testtools
 
 

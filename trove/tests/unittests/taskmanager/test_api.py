@@ -14,9 +14,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-from mock import Mock
-from mock import patch
+from unittest import mock
+from unittest.mock import Mock
+from unittest.mock import patch
 
 from trove.common import context
 from trove.common import exception
@@ -66,7 +66,7 @@ class ApiTest(trove_testtools.TestCase):
             instance_id='inst-id', locality='affinity', modules=['mod-id'],
             name='inst-name', nics=['nic-id'], overrides={}, packages=None,
             root_password='pwd', slave_of_id='slv-id', users={'name': 'usr1'},
-            volume_size=1, volume_type='type', access=None)
+            volume_size=1, volume_type='type', access=None, ds_version=None)
 
     def test_detach_replica(self):
         self.api.detach_replica('some-instance-id')

@@ -24,12 +24,13 @@ from trove.common import exception
 from trove.common.i18n import _
 from trove.common import notification
 from trove.common.notification import StartNotification
+from trove.common import pagination
 from trove.common import wsgi
+from trove.extensions.common import models as common_models
 from trove.extensions.mgmt.instances import models
 from trove.extensions.mgmt.instances import views
 from trove.extensions.mgmt.instances.views import DiagnosticsView
 from trove.extensions.mgmt.instances.views import HwInfoView
-from trove.extensions.mysql import models as mysql_models
 from trove.instance import models as instance_models
 from trove.instance.service import InstanceController
 
@@ -50,8 +51,7 @@ class MgmtInstanceController(InstanceController):
     def index(self, req, tenant_id, detailed=False):
         """Return all instances."""
         LOG.info("Indexing a database instance for tenant '%(tenant_id)s'\n"
-                 "req : '%(req)s'\n\n", {
-                     "tenant_id": tenant_id, "req": req})
+                 "req : '%(req)s'\n\n", {"tenant_id": tenant_id, "req": req})
         context = req.environ[wsgi.CONTEXT_KEY]
         deleted = None
         deleted_q = req.GET.get('deleted', '').lower()
@@ -61,15 +61,20 @@ class MgmtInstanceController(InstanceController):
             deleted = False
         clustered_q = req.GET.get('include_clustered', '').lower()
         include_clustered = clustered_q == 'true'
+        project_id = req.GET.get('project_id')
+
         try:
-            instances = models.load_mgmt_instances(
-                context, deleted=deleted, include_clustered=include_clustered)
+            instances, marker = models.load_mgmt_instances(
+                context, deleted=deleted, include_clustered=include_clustered,
+                project_id=project_id, paginated=True)
         except nova_exceptions.ClientException as e:
             LOG.exception(e)
             return wsgi.Result(str(e), 403)
 
-        view_cls = views.MgmtInstancesView
-        return wsgi.Result(view_cls(instances, req=req).data(), 200)
+        view_cls = views.MgmtInstancesView(instances, req=req)
+        paged = pagination.SimplePaginatedDataView(req.url, 'instances',
+                                                   view_cls, marker)
+        return wsgi.Result(paged.data(), 200)
 
     @admin_context
     def show(self, req, tenant_id, id):
@@ -83,8 +88,8 @@ class MgmtInstanceController(InstanceController):
         include_deleted = deleted_q == 'true'
         server = models.DetailedMgmtInstance.load(context, id,
                                                   include_deleted)
-        root_history = mysql_models.RootHistory.load(context=context,
-                                                     instance_id=id)
+        root_history = common_models.RootHistory.load(context=context,
+                                                      instance_id=id)
         return wsgi.Result(
             views.MgmtInstanceDetailView(
                 server,
@@ -106,7 +111,8 @@ class MgmtInstanceController(InstanceController):
             'stop': self._action_stop,
             'reboot': self._action_reboot,
             'migrate': self._action_migrate,
-            'reset-task-status': self._action_reset_task_status
+            'reset-task-status': self._action_reset_task_status,
+            'rebuild': self._action_rebuild
         }
         selected_action = None
         for key in body:
@@ -161,6 +167,14 @@ class MgmtInstanceController(InstanceController):
 
         return wsgi.Result(None, 202)
 
+    def _action_rebuild(self, context, instance, req, body):
+        LOG.info("Rebuild instance %s.", instance.id)
+        req_body = body['rebuild']
+        image_id = req_body['image_id']
+
+        instance.rebuild(image_id)
+        return wsgi.Result(None, 202)
+
     @admin_context
     def root(self, req, tenant_id, id):
         """Return the date and time root was enabled on an instance,
@@ -178,7 +192,7 @@ class MgmtInstanceController(InstanceController):
             LOG.exception(e)
             return wsgi.Result(str(e), 404)
         rhv = views.RootHistoryView(id)
-        reh = mysql_models.RootHistory.load(context=context, instance_id=id)
+        reh = common_models.RootHistory.load(context=context, instance_id=id)
         if reh:
             rhv = views.RootHistoryView(reh.id, enabled=reh.created,
                                         user_id=reh.user)

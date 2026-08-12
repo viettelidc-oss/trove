@@ -25,7 +25,6 @@ import jsonschema
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_service import service
-from oslo_utils import encodeutils
 import paste.urlmap
 import webob
 import webob.dec
@@ -37,10 +36,10 @@ from trove.common import context as rd_context
 from trove.common import exception
 from trove.common.i18n import _
 from trove.common import pastedeploy
+from trove.common import policy
 from trove.common import utils
 
 CONTEXT_KEY = 'trove.context'
-Router = base_wsgi.Router
 Debug = base_wsgi.Debug
 Middleware = base_wsgi.Middleware
 JSONDictSerializer = base_wsgi.JSONDictSerializer
@@ -324,6 +323,7 @@ class Controller(object):
             exception.ModuleAppliedToInstance,
             exception.PolicyNotAuthorized,
             exception.LogAccessForbidden,
+            exception.TroveOperationAuthError,
         ],
         webob.exc.HTTPBadRequest: [
             exception.InvalidModelError,
@@ -541,19 +541,22 @@ class ContextMiddleware(base_wsgi.Middleware):
         user_id = request.headers.get('X-User-ID', None)
         roles = request.headers.get('X-Role', '').split(',')
         is_admin = False
-        for role in roles:
-            if role.lower() in self.admin_roles:
-                is_admin = True
-                break
         limits = self._extract_limits(request.params)
         context = rd_context.TroveContext(auth_token=auth_token,
-                                          tenant=tenant_id,
-                                          user=user_id,
+                                          project_id=tenant_id,
+                                          user_id=user_id,
                                           is_admin=is_admin,
                                           limit=limits.get('limit'),
                                           marker=limits.get('marker'),
                                           service_catalog=service_catalog,
                                           roles=roles)
+        if self.admin_roles:
+            for role in roles:
+                if role.lower() in self.admin_roles:
+                    context.is_admin = True
+                    break
+        else:
+            context.is_admin = policy.check_is_admin(context)
         request.environ[CONTEXT_KEY] = context
 
     @classmethod
@@ -581,8 +584,7 @@ class FaultWrapper(base_wsgi.Middleware):
                 return resp
             return resp
         except Exception as ex:
-            LOG.exception("Caught error: %s.",
-                          encodeutils.exception_to_unicode(ex))
+            LOG.exception("Caught error: %s.", ex)
             exc = webob.exc.HTTPInternalServerError()
             return Fault(exc)
 

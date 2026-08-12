@@ -13,9 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-
-import six
-
 from trove.common import exception
 from trove.common import policy
 from trove.common import wsgi
@@ -45,7 +42,7 @@ class FlavorController(wsgi.Controller):
         return wsgi.Result(views.FlavorsView(flavors, req).data(), 200)
 
     def _validate_flavor_id(self, id):
-        if isinstance(id, six.string_types):
+        if isinstance(id, str):
             return
         try:
             if int(id) != float(id):

@@ -11,11 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+from unittest.mock import Mock
+from unittest.mock import patch
 import uuid
 
-from mock import Mock
-from mock import patch
 from novaclient import exceptions as nova_exceptions
+
 from trove.cluster.models import Cluster
 from trove.cluster.models import ClusterTasks
 from trove.cluster.models import DBCluster

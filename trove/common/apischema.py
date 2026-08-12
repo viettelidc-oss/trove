@@ -106,6 +106,13 @@ uuid = {
                "-([0-9a-fA-F]){4}-([0-9a-fA-F]){12}$"
 }
 
+ip_address_v4 = {
+    "type": "string",
+    "minLength": 7,
+    "maxLength": 15,
+    "pattern": r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$"
+}
+
 volume = {
     "type": "object",
     "required": ["size"],
@@ -116,7 +123,6 @@ volume = {
                 non_empty_string,
                 {"type": "null"}
             ]
-
         }
     }
 }
@@ -128,7 +134,10 @@ nics = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "net-id": uuid
+            "net-id": uuid,
+            "network_id": uuid,
+            "subnet_id": uuid,
+            "ip_address": ip_address_v4
         }
     }
 }
@@ -372,7 +381,7 @@ instance = {
         "properties": {
             "instance": {
                 "type": "object",
-                "required": ["name", "flavorRef"],
+                "required": ["name"],
                 "additionalProperties": True,
                 "properties": {
                     "name": non_empty_string,
@@ -389,13 +398,20 @@ instance = {
                             "backupRef": uuid
                         }
                     },
+                    "replica_of": uuid,
+                    "replica_count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 3
+                    },
                     "availability_zone": non_empty_string,
                     "datastore": {
                         "type": "object",
                         "additionalProperties": True,
                         "properties": {
                             "type": non_empty_string,
-                            "version": non_empty_string
+                            "version": non_empty_string,
+                            "version_number": non_empty_string
                         }
                     },
                     "nics": nics,
@@ -411,9 +427,9 @@ instance = {
                                 "uniqueItems": True,
                                 "items": {
                                     "type": "string",
-                                    "pattern": "^([0-9]{1,3}\.){3}[0-9]{1,3}"
-                                               "(\/([0-9]|[1-2][0-9]|3[0-2]))?"
-                                               "$"
+                                    "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}"
+                                               "(\\/([0-9]|[1-2][0-9]|3[0-2]))"
+                                               "?$"
                                 }
                             }
                         }
@@ -437,6 +453,41 @@ instance = {
                     "name": non_empty_string,
                     "configuration": configuration_id,
                     "datastore_version": non_empty_string,
+                }
+            }
+        }
+    },
+    "update": {
+        "name": "instance:update",
+        "type": "object",
+        "required": ["instance"],
+        "properties": {
+            "instance": {
+                "type": "object",
+                "required": [],
+                "additionalProperties": False,
+                "properties": {
+                    "name": non_empty_string,
+                    "replica_of": {},
+                    "configuration": configuration_id,
+                    "datastore_version": non_empty_string,
+                    "access": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "is_public": {"type": "boolean"},
+                            "allowed_cidrs": {
+                                "type": "array",
+                                "uniqueItems": True,
+                                "items": {
+                                    "type": "string",
+                                    "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}"
+                                               "(\\/([0-9]|[1-2][0-9]|3[0-2]))"
+                                               "?$"
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -533,6 +584,21 @@ mgmt_instance = {
                     "type": "object"
                 }
             }
+        },
+        "rebuild": {
+            "type": "object",
+            "required": ["rebuild"],
+            "additionalProperties": True,
+            "properties": {
+                "rebuild": {
+                    "type": "object",
+                    "required": ["image_id"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "image_id": uuid
+                    }
+                }
+            }
         }
     }
 }
@@ -586,16 +652,49 @@ backup = {
         "properties": {
             "backup": {
                 "type": "object",
-                "required": ["instance", "name"],
+                "required": ["name"],
                 "properties": {
                     "description": non_empty_string,
                     "instance": uuid,
                     "name": non_empty_string,
                     "parent_id": uuid,
-                    "incremental": boolean_string
+                    "incremental": boolean_string,
+                    "swift_container": non_empty_string,
+                    "restore_from": {
+                        "type": "object",
+                        "required": [
+                            "remote_location",
+                            "local_datastore_version_id",
+                            "size"
+                        ],
+                        "properties": {
+                            "remote_location": non_empty_string,
+                            "local_datastore_version_id": uuid,
+                            "size": {"type": "number"}
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+backup_strategy = {
+    "create": {
+        "name": "backup_strategy:create",
+        "type": "object",
+        "required": ["backup_strategy"],
+        "properties": {
+            "backup_strategy": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["swift_container"],
+                "properties": {
+                    "instance_id": uuid,
+                    "swift_container": non_empty_string
+                }
+            }
+        },
     }
 }
 
@@ -735,7 +834,8 @@ configuration = {
                         "additionalProperties": True,
                         "properties": {
                             "type": non_empty_string,
-                            "version": non_empty_string
+                            "version": non_empty_string,
+                            "version_number": non_empty_string
                         }
                     }
                 }
@@ -862,6 +962,19 @@ package_list = {
     }
 }
 
+image_tags = {
+    "type": "array",
+    "minItems": 0,
+    "maxItems": 5,
+    "uniqueItems": True,
+    "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 20,
+        "pattern": "^.*[0-9a-zA-Z]+.*$"
+    }
+}
+
 mgmt_datastore_version = {
     "create": {
         "name": "mgmt_datastore_version:create",
@@ -870,16 +983,21 @@ mgmt_datastore_version = {
         "properties": {
             "version": {
                 "type": "object",
-                "required": ["name", "datastore_name", "image", "active"],
-                "additionalProperties": True,
+                "required": ["name", "datastore_name", "datastore_manager",
+                             "active"],
+                "additionalProperties": False,
                 "properties": {
                     "name": non_empty_string,
                     "datastore_name": non_empty_string,
                     "datastore_manager": non_empty_string,
                     "packages": package_list,
                     "image": uuid,
+                    "image_tags": image_tags,
+                    "registry_ext": non_empty_string,
+                    "repl_strategy": non_empty_string,
                     "active": {"enum": [True, False]},
-                    "default": {"enum": [True, False]}
+                    "default": {"enum": [True, False]},
+                    "version": non_empty_string
                 }
             }
         }
@@ -888,13 +1006,17 @@ mgmt_datastore_version = {
         "name": "mgmt_datastore_version:edit",
         "type": "object",
         "required": [],
-        "additionalProperties": True,
+        "additionalProperties": False,
         "properties": {
             "datastore_manager": non_empty_string,
             "packages": package_list,
             "image": uuid,
+            "image_tags": image_tags,
+            "registry_ext": non_empty_string,
+            "repl_strategy": non_empty_string,
             "active": {"enum": [True, False]},
             "default": {"enum": [True, False]},
+            "name": non_empty_string
         }
     }
 }

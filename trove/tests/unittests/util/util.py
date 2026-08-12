@@ -27,7 +27,18 @@ def init_db():
     with LOCK:
         global DB_SETUP
         if not DB_SETUP:
+            CONF.set_override("connection",
+                              "sqlite:///trove_test.sqlite",
+                              "database")
             db_api = get_db_api()
             db_api.db_sync(CONF)
-            session.configure_db(CONF)
+            session.configure_db()
             DB_SETUP = True
+
+
+def cleanup_db():
+    with LOCK:
+        global DB_SETUP
+        if DB_SETUP:
+            session.clean_db()
+            DB_SETUP = False

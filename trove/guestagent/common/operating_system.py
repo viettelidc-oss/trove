@@ -13,15 +13,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from functools import reduce
 import inspect
 import operator
 import os
+from pathlib import Path
 import pwd
 import re
 import stat
 import tempfile
 
-from functools import reduce
 from oslo_concurrency.processutils import UnknownArgumentError
 
 from trove.common import exception
@@ -31,7 +32,6 @@ from trove.common import utils
 
 REDHAT = 'redhat'
 DEBIAN = 'debian'
-SUSE = 'suse'
 
 
 def read_file(path, codec=IdentityCodec(), as_root=False, decode=True):
@@ -143,6 +143,7 @@ def _read_file_as_root(path, open_flag, convert_func):
 
 def write_file(path, data, codec=IdentityCodec(), as_root=False, encode=True):
     """Write data into file using a given codec.
+
     Overwrite any existing contents.
     The written file can be read back into its original
     form by 'read_file'.
@@ -350,8 +351,6 @@ class FileMode(object):
 def get_os():
     if os.path.isfile("/etc/redhat-release"):
         return REDHAT
-    elif os.path.isfile("/etc/SuSE-release"):
-        return SUSE
     else:
         return DEBIAN
 
@@ -479,11 +478,46 @@ def service_discovery(service_candidates):
     return result
 
 
-def create_directory(dir_path, user=None, group=None, force=True, **kwargs):
+def execute_shell_cmd(cmd, options, *args, **kwargs):
+    """Execute a given shell command passing it
+    given options (flags) and arguments.
+
+    Takes optional keyword arguments:
+    :param as_root:        Execute as root.
+    :type as_root:         boolean
+
+    :param timeout:        Number of seconds if specified,
+                           default if not.
+                           There is no timeout if set to None.
+    :type timeout:         integer
+
+    :raises:               class:`UnknownArgumentError` if passed unknown args.
+    """
+
+    exec_args = {}
+    if kwargs.pop('as_root', False):
+        exec_args['run_as_root'] = True
+        exec_args['root_helper'] = 'sudo'
+
+    if 'timeout' in kwargs:
+        exec_args['timeout'] = kwargs.pop('timeout')
+
+    exec_args['shell'] = kwargs.pop('shell', False)
+
+    if kwargs:
+        raise UnknownArgumentError(_("Got unknown keyword args: %r") % kwargs)
+
+    cmd_flags = _build_command_options(options)
+    cmd_args = cmd_flags + list(args)
+    stdout, stderr = utils.execute_with_timeout(cmd, *cmd_args, **exec_args)
+    return stdout
+
+
+def ensure_directory(dir_path, user=None, group=None, force=True, **kwargs):
     """Create a given directory and update its ownership
     (recursively) to the given user and group if any.
 
-    seealso:: _execute_shell_cmd for valid optional keyword arguments.
+    seealso:: execute_shell_cmd for valid optional keyword arguments.
 
     :param dir_path:        Path to the created directory.
     :type dir_path:         string
@@ -513,7 +547,7 @@ def create_directory(dir_path, user=None, group=None, force=True, **kwargs):
 def chown(path, user, group, recursive=True, force=False, **kwargs):
     """Changes the owner and group of a given file.
 
-    seealso:: _execute_shell_cmd for valid optional keyword arguments.
+    seealso:: execute_shell_cmd for valid optional keyword arguments.
 
     :param path:         Path to the modified file.
     :type path:          string
@@ -543,7 +577,7 @@ def chown(path, user, group, recursive=True, force=False, **kwargs):
 
     owner_group_modifier = _build_user_group_pair(user, group)
     options = (('f', force), ('R', recursive))
-    _execute_shell_cmd('chown', options, owner_group_modifier, path, **kwargs)
+    execute_shell_cmd('chown', options, owner_group_modifier, path, **kwargs)
 
 
 def _build_user_group_pair(user, group):
@@ -559,17 +593,18 @@ def _create_directory(dir_path, force=True, **kwargs):
     :param force:           No error if existing, make parent directories
                             as needed.
     :type force:            boolean
+    :param as_root: Run as root user, default: False.
     """
 
     options = (('p', force),)
-    _execute_shell_cmd('mkdir', options, dir_path, **kwargs)
+    execute_shell_cmd('mkdir', options, dir_path, **kwargs)
 
 
 def chmod(path, mode, recursive=True, force=False, **kwargs):
     """Changes the mode of a given file.
 
     :seealso: Modes for more information on the representation of modes.
-    :seealso: _execute_shell_cmd for valid optional keyword arguments.
+    :seealso: execute_shell_cmd for valid optional keyword arguments.
 
     :param path:            Path to the modified file.
     :type path:             string
@@ -592,7 +627,7 @@ def chmod(path, mode, recursive=True, force=False, **kwargs):
     if path:
         options = (('f', force), ('R', recursive))
         shell_modes = _build_shell_chmod_mode(mode)
-        _execute_shell_cmd('chmod', options, shell_modes, path, **kwargs)
+        execute_shell_cmd('chmod', options, shell_modes, path, **kwargs)
     else:
         raise exception.UnprocessableEntity(
             _("Cannot change mode of a blank file."))
@@ -602,7 +637,7 @@ def change_user_group(user, group, append=True, add_group=True, **kwargs):
     """Adds a user to groups by using the usermod linux command with -a and
     -G options.
 
-    seealso:: _execute_shell_cmd for valid optional keyword arguments.
+    seealso:: execute_shell_cmd for valid optional keyword arguments.
 
     :param user:            Username.
     :type user:             string
@@ -631,7 +666,7 @@ def change_user_group(user, group, append=True, add_group=True, **kwargs):
         raise exception.UnprocessableEntity(_("Missing group."))
 
     options = (('a', append), ('G', add_group))
-    _execute_shell_cmd('usermod', options, group, user, **kwargs)
+    execute_shell_cmd('usermod', options, group, user, **kwargs)
 
 
 def _build_shell_chmod_mode(mode):
@@ -667,7 +702,7 @@ def _build_shell_chmod_mode(mode):
 def remove(path, force=False, recursive=True, **kwargs):
     """Remove a given file or directory.
 
-    :seealso: _execute_shell_cmd for valid optional keyword arguments.
+    :seealso: execute_shell_cmd for valid optional keyword arguments.
 
     :param path:            Path to the removed file.
     :type path:             string
@@ -683,7 +718,7 @@ def remove(path, force=False, recursive=True, **kwargs):
 
     if path:
         options = (('f', force), ('R', recursive))
-        _execute_shell_cmd('rm', options, path, **kwargs)
+        execute_shell_cmd('rm', options, path, **kwargs)
     else:
         raise exception.UnprocessableEntity(_("Cannot remove a blank file."))
 
@@ -693,7 +728,7 @@ def move(source, destination, force=False, **kwargs):
     Move attempts to preserve the original ownership, permissions and
     timestamps.
 
-    :seealso: _execute_shell_cmd for valid optional keyword arguments.
+    :seealso: execute_shell_cmd for valid optional keyword arguments.
 
     :param source:          Path to the source location.
     :type source:           string
@@ -714,16 +749,17 @@ def move(source, destination, force=False, **kwargs):
         raise exception.UnprocessableEntity(_("Missing destination path."))
 
     options = (('f', force),)
-    _execute_shell_cmd('mv', options, source, destination, **kwargs)
+    execute_shell_cmd('mv', options, source, destination, **kwargs)
 
 
 def copy(source, destination, force=False, preserve=False, recursive=True,
          dereference=False, **kwargs):
     """Copy a given file or directory to another location.
+
     Copy does NOT attempt to preserve ownership, permissions and timestamps
     unless the 'preserve' option is enabled.
 
-    :seealso: _execute_shell_cmd for valid optional keyword arguments.
+    :seealso: execute_shell_cmd for valid optional keyword arguments.
 
     :param source:          Path to the source location.
     :type source:           string
@@ -755,7 +791,7 @@ def copy(source, destination, force=False, preserve=False, recursive=True,
 
     options = (('f', force), ('p', preserve), ('R', recursive),
                ('L', dereference))
-    _execute_shell_cmd('cp', options, source, destination, **kwargs)
+    execute_shell_cmd('cp', options, source, destination, **kwargs)
 
 
 def get_bytes_free_on_fs(path):
@@ -792,7 +828,7 @@ def list_files_in_directory(root_dir, recursive=False, pattern=None,
         if pattern:
             cmd_args.extend(['-regextype', 'posix-extended',
                              '-regex', os.path.join('.*', pattern) + '$'])
-        files = _execute_shell_cmd('find', [], *cmd_args, as_root=True)
+        files = execute_shell_cmd('find', [], *cmd_args, as_root=True)
         return {fp for fp in files.splitlines()}
 
     return {os.path.abspath(os.path.join(root, name))
@@ -800,39 +836,6 @@ def list_files_in_directory(root_dir, recursive=False, pattern=None,
             if recursive or (root == root_dir)
             for name in (files + (dirs if include_dirs else []))
             if not pattern or re.match(pattern, name)}
-
-
-def _execute_shell_cmd(cmd, options, *args, **kwargs):
-    """Execute a given shell command passing it
-    given options (flags) and arguments.
-
-    Takes optional keyword arguments:
-    :param as_root:        Execute as root.
-    :type as_root:         boolean
-
-    :param timeout:        Number of seconds if specified,
-                           default if not.
-                           There is no timeout if set to None.
-    :type timeout:         integer
-
-    :raises:               class:`UnknownArgumentError` if passed unknown args.
-    """
-
-    exec_args = {}
-    if kwargs.pop('as_root', False):
-        exec_args['run_as_root'] = True
-        exec_args['root_helper'] = 'sudo'
-
-    if 'timeout' in kwargs:
-        exec_args['timeout'] = kwargs.pop('timeout')
-
-    if kwargs:
-        raise UnknownArgumentError(_("Got unknown keyword args: %r") % kwargs)
-
-    cmd_flags = _build_command_options(options)
-    cmd_args = cmd_flags + list(args)
-    stdout, stderr = utils.execute_with_timeout(cmd, *cmd_args, **exec_args)
-    return stdout
 
 
 def _build_command_options(options):
@@ -846,7 +849,7 @@ def _build_command_options(options):
 
 def get_device(path, as_root=False):
     """Get the device that a given path exists on."""
-    stdout = _execute_shell_cmd('df', [], path, as_root=as_root)
+    stdout = execute_shell_cmd('df', [], path, as_root=as_root)
     return stdout.splitlines()[1].split()[0]
 
 
@@ -867,3 +870,83 @@ def is_mount(path):
 def get_current_user():
     """Returns name of the current OS user"""
     return pwd.getpwuid(os.getuid())[0]
+
+
+def create_user(user_name, user_id, group_name=None, group_id=None):
+    group_name = group_name or user_name
+    group_id = group_id or user_id
+
+    try:
+        execute_shell_cmd('groupadd', [], '--gid', group_id, group_name,
+                          as_root=True)
+    except exception.ProcessExecutionError as err:
+        if 'already exists' not in err.stderr:
+            raise exception.UnprocessableEntity(
+                'Failed to add group %s, error: %s' % (group_name, err.stderr)
+            )
+
+    try:
+        execute_shell_cmd('useradd', [], '--uid', user_id, '--gid', group_id,
+                          '-M', user_name, as_root=True)
+    except exception.ProcessExecutionError as err:
+        if 'already exists' not in err.stderr:
+            raise exception.UnprocessableEntity(
+                'Failed to add user %s, error: %s' % (user_name, err.stderr)
+            )
+
+
+def remove_dir_contents(folder):
+    """Remove all the files and sub-directories but keep the folder.
+
+    Use shell=True here because shell=False doesn't support '*'
+    """
+    path = os.path.join(folder, '*')
+    execute_shell_cmd(f'rm -rf {path}', [], shell=True, as_root=True)
+
+
+def get_dir_size(path, as_root=False):
+    if as_root:
+        if exists(path, is_directory=True, as_root=True):
+            output = execute_shell_cmd(
+                'du', [('s', True)], path, as_root=True).strip()
+            if output:
+                return int(output.split()[0])
+        return None
+    else:
+        """Get the directory size in bytes."""
+        root_directory = Path(path)
+        return sum(f.stat().st_size for f in root_directory.glob('**/*')
+                   if f.is_file())
+
+
+def get_filesystem_size(path):
+    """Get size(bytes) of a mounted filesystem the given path locates.
+
+    path is the pathname of any file within the mounted filesystem.
+    """
+    ret = os.statvfs(path)
+    return ret.f_blocks * ret.f_frsize
+
+
+def sync(path):
+    """Sync path files to disk."""
+    if not exists(path, is_directory=True, as_root=True):
+        raise exception.UnprocessableEntity(
+            _("Invalid path: %s") % path)
+    execute_shell_cmd('sync', [], path, as_root=True)
+
+
+def fsfreeze(mount_point):
+    """Freeze mount point file system"""
+    if not exists(mount_point, is_directory=True, as_root=True):
+        raise exception.UnprocessableEntity(
+            _("Invalid path: %s") % mount_point)
+    execute_shell_cmd('fsfreeze', [('f', True)], mount_point, as_root=True)
+
+
+def fsunfreeze(mount_point):
+    """Unfreeze mount point file system"""
+    if not exists(mount_point, is_directory=True, as_root=True):
+        raise exception.UnprocessableEntity(
+            _("Invalid path: %s") % mount_point)
+    execute_shell_cmd('fsfreeze', [('u', True)], mount_point, as_root=True)

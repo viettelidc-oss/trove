@@ -12,7 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from trove.common import clients
 from trove.common import exception
@@ -35,8 +35,8 @@ class TestDatastoreVersionMetadata(TestDatastoreBase):
 
     def test_map_flavors_to_datastore(self):
         datastore = datastore_models.Datastore.load(self.ds_name)
-        ds_version = datastore_models.DatastoreVersion.load(datastore,
-                                                            self.ds_version)
+        ds_version = datastore_models.DatastoreVersion.load(
+            datastore, self.ds_version_name)
         mapping = datastore_models.DBDatastoreVersionMetadata.find_by(
             datastore_version_id=ds_version.id,
             value=self.flavor_id, deleted=False, key='flavor')
@@ -46,8 +46,8 @@ class TestDatastoreVersionMetadata(TestDatastoreBase):
 
     def test_map_volume_types_to_datastores(self):
         datastore = datastore_models.Datastore.load(self.ds_name)
-        ds_version = datastore_models.DatastoreVersion.load(datastore,
-                                                            self.ds_version)
+        ds_version = datastore_models.DatastoreVersion.load(
+            datastore, self.ds_version_name)
         mapping = datastore_models.DBDatastoreVersionMetadata.find_by(
             datastore_version_id=ds_version.id,
             value=self.volume_type, deleted=False, key='volume_type')
@@ -57,97 +57,86 @@ class TestDatastoreVersionMetadata(TestDatastoreBase):
 
     def test_add_existing_flavor_associations(self):
         dsmetadata = datastore_models.DatastoreVersionMetadata
-        self.assertRaisesRegex(
+        self.assertRaises(
             exception.DatastoreFlavorAssociationAlreadyExists,
-            "Flavor %s is already associated with datastore %s version %s"
-            % (self.flavor_id, self.ds_name, self.ds_version),
             dsmetadata.add_datastore_version_flavor_association,
-            self.ds_name, self.ds_version, [self.flavor_id])
+            self.test_id, [self.flavor_id])
 
     def test_add_existing_volume_type_associations(self):
         dsmetadata = datastore_models.DatastoreVersionMetadata
         self.assertRaises(
             exception.DatastoreVolumeTypeAssociationAlreadyExists,
             dsmetadata.add_datastore_version_volume_type_association,
-            self.ds_name, self.ds_version, [self.volume_type])
+            self.test_id, [self.volume_type])
 
     def test_delete_nonexistent_flavor_mapping(self):
         dsmeta = datastore_models.DatastoreVersionMetadata
-        self.assertRaisesRegex(
+        self.assertRaises(
             exception.DatastoreFlavorAssociationNotFound,
-            "Flavor 2 is not supported for datastore %s version %s"
-            % (self.ds_name, self.ds_version),
             dsmeta.delete_datastore_version_flavor_association,
-            self.ds_name, self.ds_version, flavor_id=2)
+            self.test_id, flavor_id=2)
 
     def test_delete_nonexistent_volume_type_mapping(self):
         dsmeta = datastore_models.DatastoreVersionMetadata
         self.assertRaises(
             exception.DatastoreVolumeTypeAssociationNotFound,
             dsmeta.delete_datastore_version_volume_type_association,
-            self.ds_name, self.ds_version,
+            self.test_id,
             volume_type_name='some random thing')
 
     def test_delete_flavor_mapping(self):
         flavor_id = 2
-        dsmetadata = datastore_models. DatastoreVersionMetadata
-        dsmetadata.add_datastore_version_flavor_association(self.ds_name,
-                                                            self.ds_version,
-                                                            [flavor_id])
-        dsmetadata.delete_datastore_version_flavor_association(self.ds_name,
-                                                               self.ds_version,
-                                                               flavor_id)
+        dsmetadata = datastore_models.DatastoreVersionMetadata
+        dsmetadata.add_datastore_version_flavor_association(
+            self.test_id, [flavor_id])
+        dsmetadata.delete_datastore_version_flavor_association(
+            self.test_id, flavor_id)
         datastore = datastore_models.Datastore.load(self.ds_name)
-        ds_version = datastore_models.DatastoreVersion.load(datastore,
-                                                            self.ds_version)
+        ds_version = datastore_models.DatastoreVersion.load(
+            datastore,
+            self.ds_version_name)
         mapping = datastore_models.DBDatastoreVersionMetadata.find_by(
             datastore_version_id=ds_version.id, value=flavor_id, key='flavor')
         self.assertTrue(mapping.deleted)
         # check update
         dsmetadata.add_datastore_version_flavor_association(
-            self.ds_name, self.ds_version, [flavor_id])
+            self.test_id, [flavor_id])
         mapping = datastore_models.DBDatastoreVersionMetadata.find_by(
             datastore_version_id=ds_version.id, value=flavor_id, key='flavor')
         self.assertFalse(mapping.deleted)
         # clear the mapping
-        datastore_models.DatastoreVersionMetadata.\
-            delete_datastore_version_flavor_association(self.ds_name,
-                                                        self.ds_version,
+        datastore_models.DatastoreVersionMetadata. \
+            delete_datastore_version_flavor_association(self.test_id,
                                                         flavor_id)
 
     def test_delete_volume_type_mapping(self):
         volume_type = 'this is bogus'
-        dsmetadata = datastore_models. DatastoreVersionMetadata
+        dsmetadata = datastore_models.DatastoreVersionMetadata
         dsmetadata.add_datastore_version_volume_type_association(
-            self.ds_name,
-            self.ds_version,
-            [volume_type])
+            self.test_id, [volume_type])
         dsmetadata.delete_datastore_version_volume_type_association(
-            self.ds_name,
-            self.ds_version,
-            volume_type)
+            self.test_id, volume_type)
         datastore = datastore_models.Datastore.load(self.ds_name)
-        ds_version = datastore_models.DatastoreVersion.load(datastore,
-                                                            self.ds_version)
+        ds_version = datastore_models.DatastoreVersion.load(
+            datastore,
+            self.ds_version_name)
         mapping = datastore_models.DBDatastoreVersionMetadata.find_by(
             datastore_version_id=ds_version.id, value=volume_type,
             key='volume_type')
         self.assertTrue(mapping.deleted)
         # check update
         dsmetadata.add_datastore_version_volume_type_association(
-            self.ds_name, self.ds_version, [volume_type])
+            self.test_id, [volume_type])
         mapping = datastore_models.DBDatastoreVersionMetadata.find_by(
             datastore_version_id=ds_version.id, value=volume_type,
             key='volume_type')
         self.assertFalse(mapping.deleted)
         # clear the mapping
         dsmetadata.delete_datastore_version_volume_type_association(
-            self.ds_name,
-            self.ds_version,
-            volume_type)
+            self.test_id, volume_type)
 
     @mock.patch.object(datastore_models.DatastoreVersionMetadata,
-                       '_datastore_version_find')
+                       'datastore_version_find')
     @mock.patch.object(datastore_models.DatastoreVersionMetadata,
                        'list_datastore_version_volume_type_associations')
     @mock.patch.object(clients, 'create_cinder_client')
@@ -175,7 +164,7 @@ class TestDatastoreVersionMetadata(TestDatastoreBase):
         mock_list.return_value = mock_trove_list_result
 
         return self.dsmetadata.allowed_datastore_version_volume_types(
-            None, 'ds', 'dsv')
+            None, self.random_uuid())
 
     def _assert_equal_types(self, test_dict, output_obj):
         self.assertEqual(test_dict.get('id'), output_obj.id)

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 """Model classes that form the core of snapshots functionality."""
-
 from oslo_log import log as logging
 from requests.exceptions import ConnectionError
 from sqlalchemy import desc
@@ -22,8 +21,11 @@ from swiftclient.client import ClientException
 from trove.backup.state import BackupState
 from trove.common import cfg
 from trove.common import clients
+from trove.common import constants
 from trove.common import exception
 from trove.common.i18n import _
+from trove.common import swift
+from trove.common import timeutils
 from trove.common import utils
 from trove.datastore import models as datastore_models
 from trove.db.models import DatabaseModelBase
@@ -49,7 +51,8 @@ class Backup(object):
 
     @classmethod
     def create(cls, context, instance, name, description=None,
-               parent_id=None, incremental=False):
+               parent_id=None, incremental=False, swift_container=None,
+               restore_from=None, storage_driver=None):
         """
         create db record for Backup
         :param cls:
@@ -59,28 +62,67 @@ class Backup(object):
         :param description:
         :param parent_id:
         :param incremental: flag to indicate incremental backup
-        based on previous backup
+                            based on previous backup
+        :param swift_container: Swift container name.
+        :param restore_from: A dict that contains backup information of another
+                             region.
+        :param storage_driver: The storage driver - that being use
+                               to save backup data.
         :return:
         """
+        backup_state = BackupState.NEW
+        checksum = None
+        instance_id = None
+        parent = None
+        last_backup_id = None
+        location = None
+        backup_type = constants.BACKUP_TYPE_FULL
+        size = None
 
-        def _create_resources():
-            # parse the ID from the Ref
+        if not storage_driver:
+            storage_driver = CONF.storage_strategy
+
+        if restore_from:
+            # Check location and datastore version.
+            LOG.info(f"Restoring backup, restore_from: {restore_from}")
+            backup_state = BackupState.RESTORED
+
+            ds_version_id = restore_from.get('local_datastore_version_id')
+            ds_version = datastore_models.DatastoreVersion.load_by_uuid(
+                ds_version_id)
+
+            location = restore_from.get('remote_location')
+            swift_client = clients.create_swift_client(context)
+            try:
+                obj_meta = swift.get_metadata(swift_client, location,
+                                              extra_attrs=['etag'])
+            except Exception:
+                msg = f'Failed to restore backup from {location}'
+                LOG.exception(msg)
+                raise exception.BackupCreationError(msg)
+
+            checksum = obj_meta['etag']
+            if 'parent_location' in obj_meta:
+                backup_type = constants.BACKUP_TYPE_INC
+
+            size = restore_from['size']
+        else:
             instance_id = utils.get_id_from_href(instance)
-
-            # verify that the instance exists and can perform actions
-            from trove.instance.models import Instance
-            instance_model = Instance.load(context, instance_id)
+            # Import here to avoid circular imports.
+            from trove.instance import models as inst_model
+            instance_model = inst_model.Instance.load(context, instance_id)
             instance_model.validate_can_perform_action()
-            cls.validate_can_perform_action(
-                instance_model, 'backup_create')
-            cls.verify_swift_auth_token(context)
             if instance_model.cluster_id is not None:
                 raise exception.ClusterInstanceOperationNotSupported()
 
+            cls.validate_can_perform_action(instance_model, 'backup_create')
+
+            if storage_driver == "swift":
+                cls.verify_swift_auth_token(context)
+
             ds = instance_model.datastore
             ds_version = instance_model.datastore_version
-            parent = None
-            last_backup_id = None
+
             if parent_id:
                 # Look up the parent info or fail early if not found or if
                 # the user does not have access to the parent.
@@ -97,35 +139,55 @@ class Backup(object):
                         'checksum': _parent.checksum
                     }
                     last_backup_id = _parent.id
+
+            if parent:
+                backup_type = constants.BACKUP_TYPE_INC
+
+        def _create_resources():
             try:
-                db_info = DBBackup.create(name=name,
-                                          description=description,
-                                          tenant_id=context.project_id,
-                                          state=BackupState.NEW,
-                                          instance_id=instance_id,
-                                          parent_id=parent_id or
-                                          last_backup_id,
-                                          datastore_version_id=ds_version.id,
-                                          deleted=False)
+                db_info = DBBackup.create(
+                    name=name,
+                    description=description,
+                    tenant_id=context.project_id,
+                    state=backup_state,
+                    instance_id=instance_id,
+                    parent_id=parent_id or last_backup_id,
+                    datastore_version_id=ds_version.id,
+                    deleted=False,
+                    location=location,
+                    checksum=checksum,
+                    backup_type=backup_type,
+                    size=size,
+                    storage_driver=storage_driver
+                )
             except exception.InvalidModelError as ex:
                 LOG.exception("Unable to create backup record for "
                               "instance: %s", instance_id)
                 raise exception.BackupCreationError(str(ex))
 
-            backup_info = {'id': db_info.id,
-                           'name': name,
-                           'description': description,
-                           'instance_id': instance_id,
-                           'backup_type': db_info.backup_type,
-                           'checksum': db_info.checksum,
-                           'parent': parent,
-                           'datastore': ds.name,
-                           'datastore_version': ds_version.name,
-                           }
-            api.API(context).create_backup(backup_info, instance_id)
+            if not restore_from:
+                backup_info = {
+                    'id': db_info.id,
+                    'name': name,
+                    'description': description,
+                    'instance_id': instance_id,
+                    'backup_type': db_info.backup_type,
+                    'checksum': db_info.checksum,
+                    'parent': parent,
+                    'datastore': ds.name,
+                    'datastore_version': ds_version.name,
+                    'storage_driver': storage_driver,
+                    'swift_container': swift_container
+                }
+                api.API(context).create_backup(backup_info, instance_id)
+            else:
+                context.notification.payload.update(
+                    {'backup_id': db_info.id}
+                )
+
             return db_info
-        return run_with_quotas(context.project_id,
-                               {'backups': 1},
+
+        return run_with_quotas(context.project_id, {'backups': 1},
                                _create_resources)
 
     @classmethod
@@ -135,14 +197,15 @@ class Backup(object):
         :param instance_id: Id of the instance
         :param exclude: Backup ID to exclude from the query (any other running)
         """
-        query = DBBackup.query()
-        query = query.filter(DBBackup.instance_id == instance_id,
-                             DBBackup.state.in_(BackupState.RUNNING_STATES))
-        # filter out deleted backups, PEP8 does not like field == False!
-        query = query.filter_by(deleted=False)
-        if exclude:
-            query = query.filter(DBBackup.id != exclude)
-        return query.first()
+        with DBBackup.query() as query:
+            query = query.filter(DBBackup.instance_id == instance_id,
+                                 DBBackup.state.in_(
+                                     BackupState.RUNNING_STATES))
+            # filter out deleted backups, PEP8 does not like field == False!
+            query = query.filter_by(deleted=False)
+            if exclude:
+                query = query.filter(DBBackup.id != exclude)
+            return query.first()
 
     @classmethod
     def get_by_id(cls, context, backup_id, deleted=False):
@@ -179,27 +242,31 @@ class Backup(object):
             marker = None
         else:
             marker += limit
-        return query.all(), marker
+        res = query.all()
+        return res, marker
 
     @classmethod
-    def list(cls, context, datastore=None, instance_id=None,
+    def list(cls, context, datastore=None, instance_id=None, project_id=None,
              all_projects=False):
-        query = DBBackup.query()
-        filters = [DBBackup.deleted == 0]
+        with DBBackup.query() as query:
+            filters = [DBBackup.deleted == 0]
 
-        if not all_projects:
-            filters.append(DBBackup.tenant_id == context.project_id)
-        if instance_id:
-            filters.append(DBBackup.instance_id == instance_id)
+            if project_id:
+                filters.append(DBBackup.tenant_id == project_id)
+            elif not all_projects:
+                filters.append(DBBackup.tenant_id == context.project_id)
 
-        if datastore:
-            ds = datastore_models.Datastore.load(datastore)
-            filters.append(datastore_models.DBDatastoreVersion.
-                           datastore_id == ds.id)
-            query = query.join(datastore_models.DBDatastoreVersion)
+            if instance_id:
+                filters.append(DBBackup.instance_id == instance_id)
 
-        query = query.filter(*filters)
-        return cls._paginate(context, query)
+            if datastore:
+                ds = datastore_models.Datastore.load(datastore)
+                filters.append(datastore_models.DBDatastoreVersion.
+                               datastore_id == ds.id)
+                query = query.join(datastore_models.DBDatastoreVersion)
+
+            query = query.filter(*filters)
+            return cls._paginate(context, query)
 
     @classmethod
     def list_for_instance(cls, context, instance_id):
@@ -209,15 +276,15 @@ class Backup(object):
         :param instance_id:
         :return:
         """
-        query = DBBackup.query()
-        if context.is_admin:
-            query = query.filter_by(instance_id=instance_id,
-                                    deleted=False)
-        else:
-            query = query.filter_by(instance_id=instance_id,
-                                    tenant_id=context.project_id,
-                                    deleted=False)
-        return cls._paginate(context, query)
+        with DBBackup.query() as query:
+            if context.is_admin:
+                query = query.filter_by(instance_id=instance_id,
+                                        deleted=False)
+            else:
+                query = query.filter_by(instance_id=instance_id,
+                                        tenant_id=context.project_id,
+                                        deleted=False)
+            return cls._paginate(context, query)
 
     @classmethod
     def get_last_completed(cls, context, instance_id,
@@ -243,13 +310,14 @@ class Backup(object):
 
     @classmethod
     def fail_for_instance(cls, instance_id):
-        query = DBBackup.query()
-        query = query.filter(DBBackup.instance_id == instance_id,
-                             DBBackup.state.in_(BackupState.RUNNING_STATES))
-        query = query.filter_by(deleted=False)
-        for backup in query.all():
-            backup.state = BackupState.FAILED
-            backup.save()
+        with DBBackup.query() as query:
+            query = query.filter(DBBackup.instance_id == instance_id,
+                                 DBBackup.state.in_(
+                                     BackupState.RUNNING_STATES))
+            query = query.filter_by(deleted=False)
+            for backup in query.all():
+                backup.state = BackupState.FAILED
+                backup.save()
 
     @classmethod
     def delete(cls, context, backup_id):
@@ -262,20 +330,25 @@ class Backup(object):
         """
 
         # Recursively delete all children and grandchildren of this backup.
-        query = DBBackup.query()
-        query = query.filter_by(parent_id=backup_id, deleted=False)
-        for child in query.all():
-            try:
-                cls.delete(context, child.id)
-            except exception.NotFound:
-                LOG.exception("Backup %s cannot be found.", backup_id)
+        with DBBackup.query() as query:
+            query = query.filter_by(parent_id=backup_id, deleted=False)
+            for child in query.all():
+                try:
+                    cls.delete(context, child.id)
+                except exception.NotFound:
+                    LOG.warning("Backup %s cannot be found.", backup_id)
 
         def _delete_resources():
             backup = cls.get_by_id(context, backup_id)
             if backup.is_running:
-                msg = _("Backup %s cannot be deleted because it is running.")
-                raise exception.UnprocessableEntity(msg % backup_id)
-            cls.verify_swift_auth_token(context)
+                delta = (timeutils.utcnow_aware() - backup.created).days
+                if delta < CONF.running_backups_expires:
+                    msg = _(
+                        "Backup %s cannot be deleted"
+                        " because it is running.")
+                    raise exception.UnprocessableEntity(msg % backup_id)
+            if backup.storage_driver == "swift":
+                cls.verify_swift_auth_token(context)
             api.API(context).delete_backup(backup_id)
 
         return run_with_quotas(context.project_id,
@@ -295,8 +368,55 @@ class Backup(object):
             raise exception.SwiftConnectionError()
 
 
+class BackupStrategy(object):
+    @classmethod
+    def create(cls, context, instance_id, swift_container):
+        try:
+            existing = DBBackupStrategy.find_by(tenant_id=context.project_id,
+                                                instance_id=instance_id)
+            existing.swift_container = swift_container
+            existing.save()
+            return existing
+        except exception.NotFound:
+            return DBBackupStrategy.create(
+                tenant_id=context.project_id,
+                instance_id=instance_id,
+                backend='swift',
+                swift_container=swift_container,
+            )
+
+    @classmethod
+    def list(cls, context, tenant_id, instance_id=None):
+        kwargs = {'tenant_id': tenant_id}
+        if instance_id:
+            kwargs['instance_id'] = instance_id
+        result = DBBackupStrategy.find_by_filter(**kwargs)
+        return result
+
+    @classmethod
+    def get(cls, context, instance_id):
+        try:
+            return DBBackupStrategy.find_by(tenant_id=context.project_id,
+                                            instance_id=instance_id)
+        except exception.NotFound:
+            try:
+                return DBBackupStrategy.find_by(tenant_id=context.project_id,
+                                                instance_id='')
+            except exception.NotFound:
+                return None
+
+    @classmethod
+    def delete(cls, context, tenant_id, instance_id):
+        try:
+            existing = DBBackupStrategy.find_by(tenant_id=tenant_id,
+                                                instance_id=instance_id)
+            existing.delete()
+        except exception.NotFound:
+            pass
+
+
 def persisted_models():
-    return {'backups': DBBackup}
+    return {'backups': DBBackup, 'backup_strategy': DBBackupStrategy}
 
 
 class DBBackup(DatabaseModelBase):
@@ -305,7 +425,7 @@ class DBBackup(DatabaseModelBase):
                     'size', 'tenant_id', 'state', 'instance_id',
                     'checksum', 'backup_timestamp', 'deleted', 'created',
                     'updated', 'deleted_at', 'parent_id',
-                    'datastore_version_id']
+                    'datastore_version_id', 'storage_driver']
     _table_name = 'backups'
 
     @property
@@ -318,7 +438,7 @@ class DBBackup(DatabaseModelBase):
 
     @property
     def is_done_successfuly(self):
-        return self.state == BackupState.COMPLETED
+        return self.state in [BackupState.COMPLETED, BackupState.RESTORED]
 
     @property
     def filename(self):
@@ -328,6 +448,13 @@ class DBBackup(DatabaseModelBase):
                 raise ValueError(_("Bad location for backup object: %s")
                                  % self.location)
             return self.location[last_slash + 1:]
+        else:
+            return None
+
+    @property
+    def container_name(self):
+        if self.location:
+            return self.location.split('/')[-2]
         else:
             return None
 
@@ -342,6 +469,16 @@ class DBBackup(DatabaseModelBase):
         if self.datastore_version_id:
             return datastore_models.DatastoreVersion.load_by_uuid(
                 self.datastore_version_id)
+
+    @property
+    def is_snapshot(self):
+        if not self.location:
+            return False
+
+        if self.location.startswith("cinder://"):
+            return True
+
+        return False
 
     def check_swift_object_exist(self, context, verify_checksum=False):
         try:
@@ -366,3 +503,27 @@ class DBBackup(DatabaseModelBase):
                 return False
             else:
                 raise exception.SwiftAuthError(tenant_id=context.project_id)
+
+    def check_volume_snapshot_exist(self, context, verify_checksum=False):
+        try:
+            snapshot_id = self.location.split('/')[-1]
+            client = clients.create_cinder_client(context)
+            LOG.debug("Checking if backup exists in %s", self.location)
+            client.volume_snapshots.get(snapshot_id)
+
+            return True
+        except Exception as e:
+            LOG.error(e)
+            return False
+
+    def check_location_exist(self, context, verify_checksum=False):
+        if self.is_snapshot:
+            return self.check_volume_snapshot_exist(context, verify_checksum)
+
+        return self.check_swift_object_exist(context, verify_checksum)
+
+
+class DBBackupStrategy(DatabaseModelBase):
+    """A table for backup strategy records."""
+    _data_fields = ['tenant_id', 'instance_id', 'backend', 'swift_container']
+    _table_name = 'backup_strategy'

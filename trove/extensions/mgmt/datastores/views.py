@@ -22,13 +22,18 @@ class DatastoreVersionView(object):
         datastore_version_dict = {
             "id": self.datastore_version.id,
             "name": self.datastore_version.name,
+            "version": self.datastore_version.version,
             "datastore_id": self.datastore_version.datastore_id,
             "datastore_name": self.datastore_version.datastore_name,
             "datastore_manager": self.datastore_version.manager,
             "image": self.datastore_version.image_id,
+            "image_tags": (self.datastore_version.image_tags.split(',')
+                           if self.datastore_version.image_tags else ['']),
             "packages": (self.datastore_version.packages.split(
                 ',') if self.datastore_version.packages else ['']),
             "active": self.datastore_version.active,
+            "registry_ext": self.datastore_version.registry_ext,
+            "repl_strategy": self.datastore_version.repl_strategy,
             "default": self.datastore_version.default}
 
         return {'version': datastore_version_dict}

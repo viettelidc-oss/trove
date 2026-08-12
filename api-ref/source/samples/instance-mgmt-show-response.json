@@ -1,5 +1,16 @@
 {
     "instance": {
+        "addresses": [
+            {
+                "address": "10.1.0.62",
+                "type": "private",
+                "network": "3dc8f3c2-f335-11eb-878c-00224d6b7bc1"
+            },
+            {
+                "address": "172.24.5.114",
+                "type": "public"
+            }
+        ],
         "created": "2019-12-23T20:58:35",
         "datastore": {
             "type": "mysql",
@@ -9,17 +20,7 @@
         "deleted_at": null,
         "encrypted_rpc_messaging": true,
         "flavor": {
-            "id": "d2",
-            "links": [
-                {
-                    "href": "https://127.0.0.1:8779/v1.0/2afa58fd5db34fd8b7b659d997a5341f/flavors/d2",
-                    "rel": "self"
-                },
-                {
-                    "href": "https://127.0.0.1:8779/flavors/d2",
-                    "rel": "bookmark"
-                }
-            ]
+            "id": "d2"
         },
         "guest_status": {
             "state_description": "healthy"
@@ -40,6 +41,7 @@
             }
         ],
         "name": "test",
+        "operating_status": "HEALTHY",
         "region": "RegionOne",
         "server": {
             "addresses": {
@@ -75,7 +77,7 @@
         "server_id": "710a84e5-6adf-4a4c-9167-8bade67a5a1c",
         "service_status": "HEALTHY",
         "service_status_updated": "2019-12-24T00:08:55",
-        "status": "HEALTHY",
+        "status": "ACTIVE",
         "task_description": "No tasks for the instance.",
         "tenant_id": "9f8dd5eacb074c9f87d2d822c9092aa5",
         "updated": "2019-12-23T23:53:46",

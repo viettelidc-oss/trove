@@ -16,12 +16,10 @@
 
 import abc
 
-import six
 from trove.common.strategies.strategy import Strategy
 
 
-@six.add_metaclass(abc.ABCMeta)
-class Replication(Strategy):
+class Replication(Strategy, metaclass=abc.ABCMeta):
     """Base class for Replication Strategy implementation."""
 
     __strategy_type__ = 'replication'
@@ -39,7 +37,7 @@ class Replication(Strategy):
         return True
 
     @abc.abstractmethod
-    def snapshot_for_replication(self, context, service, location,
+    def snapshot_for_replication(self, context, service, adm, location,
                                  snapshot_info):
         """Capture snapshot of master db."""
 
@@ -48,7 +46,7 @@ class Replication(Strategy):
         """Configure underlying database to act as master for replication."""
 
     @abc.abstractmethod
-    def enable_as_slave(self, service, snapshot, slave_config):
+    def enable_as_slave(self, service, master_info, slave_config):
         """Configure underlying database as a slave of the given master."""
 
     @abc.abstractmethod

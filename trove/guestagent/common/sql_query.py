@@ -160,14 +160,6 @@ class Grant(object):
         return self.user or ""
 
     @property
-    def _identity(self):
-        if self.clear:
-            return "IDENTIFIED BY '%s'" % self.clear
-        if self.hashed:
-            return "IDENTIFIED BY PASSWORD '%s'" % self.hashed
-        return ""
-
-    @property
     def _host(self):
         return self.host or "%"
 
@@ -187,12 +179,7 @@ class Grant(object):
 
     @property
     def _whom(self):
-        # User and host to be granted permission. Optionally, password, too.
-        whom = [("TO %s" % self._user_host),
-                self._identity,
-                ]
-        whom = [w for w in whom if w]
-        return " ".join(whom)
+        return f"TO {self._user_host}"
 
     @property
     def _with(self):
@@ -256,12 +243,7 @@ class Revoke(Grant):
     @property
     def _whom(self):
         # User and host from whom to revoke permission.
-        # Optionally, password, too.
-        whom = [("FROM %s" % self._user_host),
-                self._identity,
-                ]
-        whom = [w for w in whom if w]
-        return " ".join(whom)
+        return f"FROM {self._user_host}"
 
 
 class CreateDatabase(object):
@@ -368,21 +350,20 @@ class RenameUser(object):
 
 
 class SetPassword(object):
-
-    def __init__(self, user, host=None, new_password=None):
+    def __init__(self, user, host=None, new_password=None, ds=None,
+                 ds_version=None):
         self.user = user
         self.host = host or '%'
         self.new_password = new_password or ''
+        self.ds = ds or 'mysql'
+        self.ds_version = ds_version or '8.0'
 
     def __repr__(self):
         return str(self)
 
     def __str__(self):
-        properties = {'user_name': self.user,
-                      'user_host': self.host,
-                      'new_password': self.new_password}
-        return ("SET PASSWORD FOR '%(user_name)s'@'%(user_host)s' = "
-                "PASSWORD('%(new_password)s');" % properties)
+        return (f"ALTER USER '{self.user}'@'{self.host}' "
+                f"IDENTIFIED BY '{self.new_password}';")
 
 
 class DropUser(object):
@@ -419,8 +400,8 @@ class SetServerVariable(object):
         else:
             return "SET GLOBAL %s=%s" % (self.key, self.value)
 
-# Miscellaneous queries that need no parameters.
 
+# Miscellaneous queries that need no parameters.
 FLUSH = "FLUSH PRIVILEGES;"
 ROOT_ENABLED = ("SELECT User FROM mysql.user "
                 "WHERE User = 'root' AND Host != 'localhost';")

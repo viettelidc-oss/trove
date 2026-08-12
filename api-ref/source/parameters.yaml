@@ -74,10 +74,18 @@ user_project:
   type: string
 version:
   description: |
-    Name or ID of the datastore version.
+    Name or ID of the datastore version. If there are multiple datastore
+    versions with the same name but different version numbers, ID is needed.
   in: path
   required: false
   type: string
+# variables in query
+ssl_include_cert:
+  description: |
+    If false or not provided, certificate payload is omitted.
+  in: query
+  required: false
+  type: boolean
 # variables in body
 access:
   description: |
@@ -99,11 +107,29 @@ access_is_public:
   in: body
   required: false
   type: boolean
+active:
+  description: |
+    Whether the database version is enabled.
+  in: body
+  required: true
+  type: boolean
+active_optional:
+  description: |
+    Whether the database version is enabled.
+  in: body
+  required: false
+  type: boolean
 availability_zone:
   description: |
     The availability zone of the instance.
   in: body
   required: false
+  type: string
+backup_backend:
+  description: |
+    The storage backend of instance backups, currently only swift is supported.
+  in: body
+  required: true
   type: string
 backup_description:
   description: |
@@ -129,7 +155,7 @@ backup_instanceId:
   description: |
     The ID of the instance to create backup for.
   in: body
-  required: true
+  required: false
   type: string
 backup_list:
   description: |
@@ -161,6 +187,17 @@ backup_parentId1:
   in: body
   required: true
   type: string
+backup_restore_from:
+  description: |
+    The information needed to restore a backup, including:
+
+    - ``remote_location``: The original backup data location.
+    - ``local_datastore_version_id``: The local datastore version corresponding
+      to the original backup.
+    - ``size``: The original backup size.
+  in: body
+  required: false
+  type: object
 backup_size:
   description: |
     Size of the backup, the unit is GB.
@@ -173,6 +210,12 @@ backup_status:
   in: body
   required: true
   type: string
+backup_strategy_list:
+  description: |
+    A list of ``backup_strategy`` objects.
+  in: body
+  required: true
+  type: array
 characterSet:
   description: |
     A set of symbols and encodings. Default is
@@ -211,6 +254,12 @@ configuration1:
   in: body
   required: false
   type: object
+configuration_detach:
+  description: |
+    Omit or set ``null`` to detach configuration from instance.
+  in: body
+  required: false
+  type: string
 configuration_id:
   description: |
     The ID of a configuration.
@@ -273,8 +322,8 @@ databases:
   type: array
 datastore:
   description: |
-    Data store assigned to the configuration group.
-    Required if you did not configure the default data store.
+    Data store type and version assigned to the configuration group.
+    Required if the default data store is not configured.
   in: body
   required: true
   type: string
@@ -290,6 +339,12 @@ datastore2:
   in: body
   required: true
   type: object
+datastore_name_required:
+   description: |
+     The name of a datastore.
+   in: body
+   required: true
+   type: string
 datastore_type:
    description: |
      The type of a datastore.
@@ -323,10 +378,26 @@ datastore_version_id1:
   type: string
 datastore_version_name:
   description: |
-    The name of the datastore version.
+    The name of the datastore version. Different datastore versions can have
+    the same name.
   in: body
   required: true
   type: string
+datastore_version_name_optional:
+  description: |
+    The name of the datastore version. Different datastore versions can have
+    the same name.
+  in: body
+  required: false
+  type: string
+default:
+  description: |
+    When true this datastore version is created as the default in the
+    datastore. If not specified, for creating, default is false, for updating,
+    it's ignored.
+  in: body
+  required: false
+  type: boolean
 description:
   description: |
     New description of the configuration group.
@@ -380,6 +451,33 @@ flavorRef:
   in: body
   required: true
   type: string
+image_id:
+  description: |
+    The ID of an image.
+
+    Either ``image`` or ``image_tags`` needs to be specified when creating
+    datastore version.
+  in: body
+  required: false
+  type: string
+image_tags:
+  description: |
+    List of image tags.
+
+    Either ``image`` or ``image_tags`` needs to be specified when creating
+    datastore version.
+
+    If the image ID is not provided, the image can be retrieved by the image
+    tags. The tags are used for filtering as a whole rather than separately.
+    Using image tags is more flexible than ID especially when a new guest image
+    is uploaded to Glance, Trove can pick up the latest image automatically for
+    creating instances.
+
+    When updating, only specifying ``image_tags`` could remove ``image``
+    from the datastore version.
+  in: body
+  required: false
+  type: array
 instance:
   description: |
     An ``instance`` object.
@@ -417,12 +515,26 @@ instance_hostname:
   in: body
   require: false
   type: string
+instance_id_optional:
+  description: |
+    The ID of the database instance.
+  in: body
+  required: false
+  type: string
 instance_ip_address:
   description: |
-    The IP address of an instance.
+    The IP address of an instance(deprecated).
   in: body
   require: false
   type: string
+instance_ip_addresses:
+  description: |
+    The IP addresses of an instance, including the address type("private" or
+    "public") and IP. "network" field is added since Xena when the address type
+    is "private".
+  in: body
+  require: false
+  type: array
 instance_link_href:
   description: |
     The ``href`` attribute of an instance link.
@@ -483,6 +595,30 @@ instance_replicas:
   in: body
   required: false
   type: array
+instance_ssl:
+  description: |
+    An ``ssl`` object.
+  in: body
+  required: true
+  type: object
+  properties:
+    status:
+      type: string
+    mode:
+      type: string
+    container_ref:
+      type: string
+    certificate:
+      type: object
+      properties:
+        payload:
+          type: string
+        cn:
+          type: string
+        expire_at:
+          type: string
+        san:
+          type: [string, "null"]
 instance_status:
   description: |
     Status of the instance.
@@ -618,14 +754,31 @@ name:
   type: string
 nics:
   description: |
-     Network interfaces for database service inside Nova instances.
-     ``NOTE:`` For backward compatibility, this parameter uses the same schema
-     as novaclient creating servers, but only ``net-id`` is supported and can
-     only be specified once. This parameter is required in service tenant
-     deployment model.
+    Network interface definition for database instance. This is a list of
+    mappings for backward compatibility, but only one item is allowed. The
+    allowed keys in the mapping are: network_id, subnet_id, ip_address and
+    net-id (for backward compatibility, deprecated).
+
+    Trove will allocate port using the given information. In order to
+    successfully create database instance, either the user should make sure the
+    traffic coming through that port could access the public contaier image
+    registry(i.e. the port subnet is associated with a Neutron router), or the
+    cloud provider should be responsible for that.
   in: body
   required: false
   type: array
+operating_status:
+  description: |
+    The operating status of the database service inside the Trove instance.
+  in: body
+  required: true
+  type: string
+project_uuid:
+  description: |
+    The project ID of the resource.
+  in: body
+  required: true
+  type: string
 quota_in_use:
   description: |
     The used quota for a resource.
@@ -682,8 +835,13 @@ replica_count:
   type: integer
 replica_of:
   description: |
-    ID or name of an existing instance to replicate
-    from.
+    ID or name of an existing instance to replicate from.
+  in: body
+  required: true
+  type: string
+replica_of_optional:
+  description: |
+    The primary instance ID of this replica.
   in: body
   required: false
   type: string
@@ -729,7 +887,114 @@ shard_id:
    type: string
 slave_of:
   description: |
-    To detach a replica, set ``slave_of`` to null.
+    To detach a replica, set ``slave_of`` to null. Deprecated in favor of
+    ``replica_of``
+  in: body
+  required: false
+  type: string
+ssl_action_disable:
+  description: |
+    Disable installed SSL certificate.
+  in: body
+  required: false
+  type: boolean
+ssl_action_enable:
+  description: |
+    Enable new SSL certificate.
+  in: body
+  required: false
+  type: boolean
+ssl_action_rollback:
+  description: |
+    Rollback to last SSL configuration.
+  in: body
+  required: false
+  type: boolean
+ssl_certificate:
+  description: |
+    Certificate object
+  in: body
+  required: false
+  type: object
+ssl_certificate_cn:
+  description: |
+    CN for the current installed certificate.
+  in: body
+  required: false
+  type: string
+ssl_certificate_expire_at:
+  description: |
+    Expiration timestamp of the current certificate.
+  in: body
+  required: false
+  type: string
+ssl_certificate_payload:
+  description: |
+    Contains public certificate only. Private keys are never exposed.
+    Provided only if `?include_certificate=true` query param is
+    present.
+  in: body
+  required: false
+  type: string
+ssl_certificate_san:
+  description: |
+    Certificate Subject Alternative Names.
+  in: body
+  required: false
+  type: array
+  items:
+    type: string
+ssl_container_ref:
+  description: |
+    Reference to a PKCS#12 container stored in Barbican.
+  in: body
+  required: false
+  type: string
+ssl_mode:
+  description: |
+    Currently enabled SSL/TLS mode:
+      - builtin (default certificates installed by DBMS)
+      - basic
+      - enforced
+      - mtls
+  in: body
+  required: true
+  type: string
+ssl_password_ref:
+  description: |
+    Provide a Barbican reference to the password if the PKCS#12 container is
+    password-protected, with instance project member scope.
+  in: body
+  required: false
+  type: string
+ssl_restart_required:
+  description: |
+    True if configuration changes require database restart to take effect.
+  in: body
+  required: false
+  type: boolean
+ssl_status:
+  description: |
+    "on" if SSL is enabled, "off" if SSL is disabled or misconfigured.
+  in: body
+  required: true
+  type: enum
+  enum: [on, off]
+storage_driver:
+  description: |
+    The backup strategy
+  type: string
+  in: body
+  required: false
+swift_container:
+  description: |
+    User defined swift container name. When creating backups, the swift
+    container is created automatically if does not exist.
+  in: body
+  required: false
+  type: string
+swift_container_required:
+  description: User defined swift container name.
   in: body
   required: true
   type: string
@@ -804,6 +1069,14 @@ values:
   in: body
   required: true
   type: string
+version_number:
+  description: |
+    The version number for the database. In container based trove instance
+    deployment, the version number is the same as the container image tag,
+    e.g. for MySQL, a valid version number is 5.7.30
+  in: body
+  required: false
+  type: string
 volume:
   description: |
     A ``volume`` object.
@@ -845,3 +1118,26 @@ volume_used:
   in: body
   required: false
   type: float
+volume_used_percent:
+  description: |
+    The real used space of the volume, in percent. This value considers
+    real available disk space after GB -> GiB conversion and unavailable
+    blocks reserved by system. Please note that after reaching 100%,
+    most databases will crash or become readonly.
+  in: body
+  required: false
+  type: string
+wal_archive_size:
+  description: |
+    The used space of the WAL archive folder, in bytes.
+    PostgreSQL manager only.
+  in: body
+  required: false
+  type: integer
+wal_size:
+  description: |
+    The used space of the WAL folder, in bytes.
+    PostgreSQL manager only.
+  in: body
+  required: false
+  type: integer

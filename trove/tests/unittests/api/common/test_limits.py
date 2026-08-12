@@ -17,11 +17,11 @@
 Tests dealing with HTTP rate-limiting.
 """
 
+from http import client as http_client
+import io
+from unittest.mock import Mock, MagicMock, patch
 
-from mock import Mock, MagicMock, patch
 from oslo_serialization import jsonutils
-import six
-from six.moves import http_client
 import webob
 
 from trove.common import limits
@@ -48,6 +48,7 @@ class BaseLimitTestSuite(trove_testtools.TestCase):
         self.context = trove_testtools.TroveTestContext(self)
         self.absolute_limits = {"max_instances": 55,
                                 "max_volumes": 100,
+                                "max_ram": 200,
                                 "max_backups": 40}
 
 
@@ -114,6 +115,10 @@ class LimitsControllerTest(BaseLimitTestSuite):
                                          resource="instances",
                                          hard_limit=100),
 
+                      "ram": Quota(tenant_id=tenant_id,
+                                   resource="ram",
+                                   hard_limit=200),
+
                       "backups": Quota(tenant_id=tenant_id,
                                        resource="backups",
                                        hard_limit=40),
@@ -135,6 +140,7 @@ class LimitsControllerTest(BaseLimitTestSuite):
                     {
                         'max_instances': 100,
                         'max_backups': 40,
+                        'max_ram': 200,
                         'verb': 'ABSOLUTE',
                         'max_volumes': 55
                     },
@@ -307,36 +313,38 @@ class ParseLimitsTest(BaseLimitTestSuite):
     def test_multiple_rules(self):
         # Test that parse_limits() handles multiple rules correctly.
         try:
-            l = limits.Limiter.parse_limits('(get, *, .*, 20, minute);'
-                                            '(PUT, /foo*, /foo.*, 10, hour);'
-                                            '(POST, /bar*, /bar.*, 5, second);'
-                                            '(Say, /derp*, /derp.*, 1, day)')
+            result = limits.Limiter.parse_limits(
+                '(get, *, .*, 20, minute);'
+                '(PUT, /foo*, /foo.*, 10, hour);'
+                '(POST, /bar*, /bar.*, 5, second);'
+                '(Say, /derp*, /derp.*, 1, day)'
+            )
         except ValueError as e:
             assert False, str(e)
 
         # Make sure the number of returned limits are correct
-        self.assertEqual(4, len(l))
+        self.assertEqual(4, len(result))
 
         # Check all the verbs...
         expected = ['GET', 'PUT', 'POST', 'SAY']
-        self.assertEqual(expected, [t.verb for t in l])
+        self.assertEqual(expected, [t.verb for t in result])
 
         # ...the URIs...
         expected = ['*', '/foo*', '/bar*', '/derp*']
-        self.assertEqual(expected, [t.uri for t in l])
+        self.assertEqual(expected, [t.uri for t in result])
 
         # ...the regexes...
         expected = ['.*', '/foo.*', '/bar.*', '/derp.*']
-        self.assertEqual(expected, [t.regex for t in l])
+        self.assertEqual(expected, [t.regex for t in result])
 
         # ...the values...
         expected = [20, 10, 5, 1]
-        self.assertEqual(expected, [t.value for t in l])
+        self.assertEqual(expected, [t.value for t in result])
 
         # ...and the units...
         expected = [limits.PER_MINUTE, limits.PER_HOUR,
                     limits.PER_SECOND, limits.PER_DAY]
-        self.assertEqual(expected, [t.unit for t in l])
+        self.assertEqual(expected, [t.unit for t in result])
 
 
 class LimiterTest(BaseLimitTestSuite):
@@ -562,7 +570,7 @@ class FakeHttplibSocket(object):
 
     def __init__(self, response_string):
         """Initialize new `FakeHttplibSocket`."""
-        self._buffer = six.BytesIO(response_string)
+        self._buffer = io.BytesIO(response_string)
 
     def makefile(self, _mode, *args):
         """Returns the socket's internal buffer."""
@@ -598,8 +606,7 @@ class FakeHttplibConnection(object):
 
         resp = str(req.get_response(self.app))
         resp = "HTTP/1.0 %s" % resp
-        if six.PY3:
-            resp = resp.encode("utf-8")
+        resp = resp.encode("utf-8")
         sock = FakeHttplibSocket(resp)
         self.http_response = http_client.HTTPResponse(sock)
         self.http_response.begin()
@@ -797,7 +804,7 @@ class LimitsViewsTest(trove_testtools.TestCase):
                 "resetTime": 1311272226
             }
         ]
-        abs_view = {"instances": 55, "volumes": 100, "backups": 40}
+        abs_view = {"instances": 55, "volumes": 100, "backups": 40, 'ram': 200}
 
         view_data = views.LimitViews(abs_view, rate_limits)
         self.assertIsNotNone(view_data)
@@ -805,6 +812,7 @@ class LimitsViewsTest(trove_testtools.TestCase):
         data = view_data.data()
         expected = {'limits': [{'max_instances': 55,
                                 'max_backups': 40,
+                                'max_ram': 200,
                                 'verb': 'ABSOLUTE',
                                 'max_volumes': 100},
                                {'regex': '.*',

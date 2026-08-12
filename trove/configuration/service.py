@@ -14,7 +14,6 @@
 #    under the License.
 
 from oslo_log import log as logging
-import six
 
 from trove.cluster import models as cluster_models
 import trove.common.apischema as apischema
@@ -65,10 +64,15 @@ class ConfigurationsController(wsgi.Controller):
         self.authorize_config_action(context, 'show', configuration)
         configuration_items = models.Configuration.load_items(context, id)
 
+        find_instance = {
+            'configuration_id': configuration.id,
+            'deleted': False
+        }
+        if not context.is_admin:
+            find_instance['tenant_id'] = context.project_id
+
         configuration.instance_count = instances_models.DBInstance.find_all(
-            tenant_id=context.project_id,
-            configuration_id=configuration.id,
-            deleted=False).count()
+            **find_instance).count()
 
         return wsgi.Result(views.DetailedConfigurationView(
                            configuration,
@@ -78,10 +82,15 @@ class ConfigurationsController(wsgi.Controller):
         context = req.environ[wsgi.CONTEXT_KEY]
         configuration = models.Configuration.load(context, id)
         self.authorize_config_action(context, 'instances', configuration)
-        instances = instances_models.DBInstance.find_all(
-            tenant_id=context.tenant,
-            configuration_id=configuration.id,
-            deleted=False)
+
+        kwargs = {
+            'configuration_id': configuration.id,
+            'deleted': False
+        }
+        if not context.is_admin:
+            kwargs['tenant_id'] = context.project_id
+        instances = instances_models.DBInstance.find_all(**kwargs)
+
         limit = int(context.limit or CONF.instances_page_size)
         if limit > CONF.instances_page_size:
             limit = CONF.instances_page_size
@@ -112,7 +121,8 @@ class ConfigurationsController(wsgi.Controller):
 
         datastore_args = body['configuration'].get('datastore', {})
         datastore, datastore_version = (
-            ds_models.get_datastore_version(**datastore_args))
+            ds_models.get_datastore_version(
+                **datastore_args, return_inactive=True))
 
         with StartNotification(context, name=name, datastore=datastore.name,
                                datastore_version=datastore_version.name):
@@ -218,8 +228,6 @@ class ConfigurationsController(wsgi.Controller):
     def _refresh_on_all_instances(self, context, configuration_id):
         """Refresh a configuration group on all single instances.
         """
-        LOG.debug("Re-applying configuration group '%s' to all instances.",
-                  configuration_id)
         single_instances = instances_models.DBInstance.find_all(
             tenant_id=context.project_id,
             configuration_id=configuration_id,
@@ -228,8 +236,8 @@ class ConfigurationsController(wsgi.Controller):
 
         config = models.Configuration(context, configuration_id)
         for dbinstance in single_instances:
-            LOG.debug("Re-applying configuration to instance: %s",
-                      dbinstance.id)
+            LOG.info("Re-applying configuration %s to instance: %s",
+                     configuration_id, dbinstance.id)
             instance = instances_models.Instance.load(context, dbinstance.id)
             instance.update_configuration(config)
 
@@ -239,7 +247,7 @@ class ConfigurationsController(wsgi.Controller):
         LOG.debug("Re-applying configuration group '%s' to all clusters.",
                   configuration_id)
         clusters = cluster_models.DBCluster.find_all(
-            tenant_id=context.tenant,
+            tenant_id=context.project_id,
             configuration_id=configuration_id,
             deleted=False).all()
 
@@ -309,15 +317,19 @@ class ConfigurationsController(wsgi.Controller):
                 raise exception.UnprocessableEntity(message=msg)
 
             # integer min/max checking
-            if isinstance(v, six.integer_types) and not isinstance(v, bool):
+            if (isinstance(v, int) or isinstance(v, float)) and\
+               not isinstance(v, bool):
                 if rule.min_size is not None:
                     try:
-                        min_value = int(rule.min_size)
+                        if isinstance(v, int):
+                            min_value = int(rule.min_size)
+                        elif isinstance(v, float):
+                            min_value = float(rule.min_size)
                     except ValueError:
                         raise exception.TroveError(_(
                             "Invalid or unsupported min value defined in the "
                             "configuration-parameters configuration file. "
-                            "Expected integer."))
+                            "Expected %s." % rule.data_type))
                     if v < min_value:
                         output = {"key": k, "min": min_value}
                         message = _(
@@ -328,12 +340,15 @@ class ConfigurationsController(wsgi.Controller):
 
                 if rule.max_size is not None:
                     try:
-                        max_value = int(rule.max_size)
+                        if isinstance(v, int):
+                            max_value = int(rule.max_size)
+                        elif isinstance(v, float):
+                            max_value = float(rule.max_size)
                     except ValueError:
                         raise exception.TroveError(_(
                             "Invalid or unsupported max value defined in the "
                             "configuration-parameters configuration file. "
-                            "Expected integer."))
+                            "Expected %s." % rule.data_type))
                     if v > max_value:
                         output = {"key": k, "max": max_value}
                         message = _(
@@ -347,9 +362,9 @@ class ConfigurationsController(wsgi.Controller):
         if value_type == "boolean":
             return bool
         elif value_type == "string":
-            return six.string_types
+            return str
         elif value_type == "integer":
-            return six.integer_types
+            return int
         elif value_type == "float":
             return float
         else:
@@ -381,7 +396,7 @@ class ParametersController(wsgi.Controller):
     def index(self, req, tenant_id, datastore, id):
         self.authorize_request(req, 'index')
         ds, ds_version = ds_models.get_datastore_version(
-            type=datastore, version=id)
+            type=datastore, version=id, return_inactive=True)
         rules = models.DatastoreConfigurationParameters.load_parameters(
             ds_version.id)
         return wsgi.Result(views.ConfigurationParametersView(rules).data(),
@@ -390,7 +405,7 @@ class ParametersController(wsgi.Controller):
     def show(self, req, tenant_id, datastore, id, name):
         self.authorize_request(req, 'show')
         ds, ds_version = ds_models.get_datastore_version(
-            type=datastore, version=id)
+            type=datastore, version=id, return_inactive=True)
         rule = models.DatastoreConfigurationParameters.load_parameter_by_name(
             ds_version.id, name)
         return wsgi.Result(views.ConfigurationParameterView(rule).data(), 200)

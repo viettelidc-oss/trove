@@ -14,7 +14,7 @@
 #    under the License.
 #
 import jsonschema
-from mock import MagicMock
+from unittest.mock import MagicMock
 
 from trove.common import configurations
 from trove.common.exception import UnprocessableEntity
@@ -120,7 +120,7 @@ class TestConfigurationController(trove_testtools.TestCase):
             self._test_validate_configuration_with_action(body,
                                                           action='create',
                                                           is_valid=False))
-        self.assertIn("'' is too short", error_messages)
+        self.assertIn("'' should be non-empty", error_messages)
 
     def test_validate_edit_configuration(self):
         body = {
@@ -178,6 +178,26 @@ class TestConfigurationController(trove_testtools.TestCase):
         ConfigurationsController._validate_configuration(
             {'myisam_sort_buffer_size': 18446744073709551615},
             None, config_rules)
+
+    def test_validate_float_values(self):
+        config_val1 = MagicMock()
+        config_val1.name = 'long_query_time'
+        config_val1.max_size = 100.0
+        config_val1.min_size = 0
+        config_val1.data_type = 'float'
+        config_rules = [config_val1]
+
+        ConfigurationsController._validate_configuration(
+            {'long_query_time': 5.1},
+            None, config_rules)
+
+        invalid_values = ["5", 5, False, 200.0]
+        for value in invalid_values:
+            self.assertRaises(UnprocessableEntity,
+                              ConfigurationsController._validate_configuration,
+                              {'long_query_time': value},
+                              None,
+                              config_rules)
 
 
 class TestConfigurationsParameterController(trove_testtools.TestCase):

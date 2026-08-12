@@ -1,4 +1,9 @@
 {
+  "distro": {
+    "ubuntu": {
+        "ureadahead": ""
+        }
+    },
   "family": {
     "redhat": {
       "guest-agent": "openstack-trove-guest-agent",

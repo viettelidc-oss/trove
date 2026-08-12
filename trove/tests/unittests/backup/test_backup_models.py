@@ -13,9 +13,10 @@
 
 
 import datetime
-from mock import DEFAULT
-from mock import MagicMock
-from mock import patch
+from unittest.mock import DEFAULT
+from unittest.mock import MagicMock
+from unittest.mock import patch
+
 from swiftclient.client import ClientException
 
 from trove.backup import models
@@ -33,9 +34,10 @@ from trove.tests.unittests.util import util
 
 def _prep_conf(current_time):
     current_time = str(current_time)
-    _context = context.TroveContext(tenant='TENANT-' + current_time)
+    _context = context.TroveContext(project_id='TENANT-' + current_time)
     instance_id = 'INSTANCE-' + current_time
     return _context, instance_id
+
 
 BACKUP_NAME = 'WORKS'
 BACKUP_NAME_2 = 'IT-WORKS'
@@ -64,7 +66,7 @@ class BackupCreateTest(trove_testtools.TestCase):
                 tenant_id=self.context.project_id).delete()
 
     @patch.object(api.API, 'get_client', MagicMock(return_value=MagicMock()))
-    def test_create(self):
+    def test_create_backup(self):
         instance = MagicMock()
         with patch.object(instance_models.BuiltInstance, 'load',
                           return_value=instance):
@@ -175,7 +177,7 @@ class BackupCreateTest(trove_testtools.TestCase):
                               BACKUP_NAME, BACKUP_DESC)
 
     def test_create_backup_swift_token_invalid(self):
-        instance = MagicMock()
+        instance = MagicMock(cluster_id=None)
         with patch.object(instance_models.BuiltInstance, 'load',
                           return_value=instance):
             instance.validate_can_perform_action = MagicMock(
@@ -190,7 +192,7 @@ class BackupCreateTest(trove_testtools.TestCase):
                                       BACKUP_NAME, BACKUP_DESC)
 
     def test_create_backup_datastore_operation_not_supported(self):
-        instance = MagicMock()
+        instance = MagicMock(cluster_id=None)
         with patch.object(instance_models.BuiltInstance, 'load',
                           return_value=instance):
             with patch.object(
@@ -206,9 +208,9 @@ class BackupCreateTest(trove_testtools.TestCase):
         instance = MagicMock()
         instance.cluster_id = 'bad_id'
         with patch.object(instance_models.BuiltInstance, 'load',
-                          return_value=instance),\
+                          return_value=instance), \
             patch.object(models.Backup, 'validate_can_perform_action',
-                         return_value=None),\
+                         return_value=None), \
             patch.object(models.Backup, 'verify_swift_auth_token',
                          return_value=None):
             self.assertRaises(exception.ClusterInstanceOperationNotSupported,
@@ -221,13 +223,13 @@ class BackupCreateTest(trove_testtools.TestCase):
         instance = MagicMock()
         instance.cluster_id = None
         with patch.object(instance_models.BuiltInstance, 'load',
-                          return_value=instance),\
+                          return_value=instance), \
             patch.object(models.Backup, 'validate_can_perform_action',
-                         return_value=None),\
+                         return_value=None), \
             patch.object(models.Backup, 'verify_swift_auth_token',
-                         return_value=None),\
+                         return_value=None), \
             patch.object(DatabaseModelBase, 'is_valid',
-                         return_value=False),\
+                         return_value=False), \
             patch('trove.quota.quota.QuotaEngine.reserve',
                   return_value=[]):
             DatabaseModelBase.errors = {}
@@ -253,13 +255,26 @@ class BackupDeleteTest(trove_testtools.TestCase):
     def test_delete_backup_is_running(self):
         backup = MagicMock()
         backup.is_running = True
+        backup.created = datetime.datetime.now(datetime.timezone.utc)
         with patch.object(models.Backup, 'get_by_id', return_value=backup):
             self.assertRaises(exception.UnprocessableEntity,
                               models.Backup.delete, self.context, 'backup_id')
 
+    @patch('trove.taskmanager.api.API')
+    def test_delete_backup_outdated_is_running(self, mock_api):
+        mock_instance = mock_api.return_value
+        backup = MagicMock()
+        backup.is_running = True
+        backup.created = datetime.datetime.now(
+            datetime.timezone.utc) - datetime.timedelta(weeks=1)
+        with patch.object(models.Backup, 'get_by_id', return_value=backup):
+            models.Backup.delete(self.context, 'backup_id')
+            mock_instance.delete_backup.assert_called_once_with('backup_id')
+
     def test_delete_backup_swift_token_invalid(self):
         backup = MagicMock()
         backup.is_running = False
+        backup.storage_driver = "swift"
         with patch.object(models.Backup, 'get_by_id', return_value=backup):
             with patch.object(models.Backup, 'verify_swift_auth_token',
                               side_effect=exception.SwiftAuthError):
@@ -392,6 +407,69 @@ class BackupORMTest(trove_testtools.TestCase):
     def test_filename(self):
         self.assertEqual(BACKUP_FILENAME, self.backup.filename)
 
+    def test_is_failed(self):
+        self.backup.state = state.BackupState.FAILED
+        self.backup.location = None
+        self.backup.save()
+        self.assertIsNone(self.backup.container_name)
+
+    def test_create_snapshot(self):
+        backup = models.DBBackup.create(tenant_id=self.context.project_id,
+                                        name=BACKUP_NAME,
+                                        state=BACKUP_STATE,
+                                        instance_id=self.instance_id,
+                                        deleted=False,
+                                        size=2.0,
+                                        storage_driver="cinder",
+                                        location="cinder://snapshot_id")
+        self.assertEqual(backup.is_snapshot, True)
+
+    def test_create_without_snapshot(self):
+        backup = models.DBBackup.create(tenant_id=self.context.project_id,
+                                        name=BACKUP_NAME,
+                                        state=BACKUP_STATE,
+                                        instance_id=self.instance_id,
+                                        deleted=False,
+                                        size=2.0,
+                                        storage_driver="swift",
+                                        location=BACKUP_LOCATION)
+        self.assertEqual(backup.is_snapshot, False)
+        self.assertEqual(backup.location, BACKUP_LOCATION)
+
+    def test_create_without_storage_driver_swift(self):
+        self.patch_conf_property('storage_strategy', 'swift')
+        backup = models.DBBackup.create(tenant_id=self.context.project_id,
+                                        name=BACKUP_NAME,
+                                        state=BACKUP_STATE,
+                                        instance_id=self.instance_id,
+                                        deleted=False,
+                                        size=2.0,
+                                        location=BACKUP_LOCATION)
+        self.assertFalse(backup.is_snapshot)
+
+    def test_create_without_storage_driver_cinder(self):
+        self.patch_conf_property('storage_strategy', 'cinder')
+        backup = models.DBBackup.create(tenant_id=self.context.project_id,
+                                        name=BACKUP_NAME,
+                                        state=BACKUP_STATE,
+                                        instance_id=self.instance_id,
+                                        deleted=False,
+                                        size=2.0,
+                                        location="cinder://snapshot_id")
+        self.assertTrue(backup.is_snapshot)
+
+    def test_check_location_exist_cinder(self):
+        self.patch_conf_property('storage_strategy', 'cinder')
+        backup = models.DBBackup.create(tenant_id=self.context.project_id,
+                                        name=BACKUP_NAME,
+                                        state=BACKUP_STATE,
+                                        instance_id=self.instance_id,
+                                        deleted=False,
+                                        size=2.0,
+                                        location="cinder://snapshot_id")
+        self.assertTrue(backup.is_snapshot)
+        self.assertFalse(backup.check_location_exist(self.context))
+
     def test_filename_bad(self):
 
         def _set_bad_filename():
@@ -466,8 +544,8 @@ class PaginationTests(trove_testtools.TestCase):
 
     def tearDown(self):
         super(PaginationTests, self).tearDown()
-        query = models.DBBackup.query()
-        query.filter_by(instance_id=self.instance_id).delete()
+        with models.DBBackup.query() as query:
+            query.filter_by(instance_id=self.instance_id).delete()
 
     def test_pagination_list(self):
         # page one
@@ -539,14 +617,14 @@ class OrderingTests(trove_testtools.TestCase):
 
     def tearDown(self):
         super(OrderingTests, self).tearDown()
-        query = models.DBBackup.query()
-        query.filter_by(instance_id=self.instance_id).delete()
+        with models.DBBackup.query() as query:
+            query.filter_by(instance_id=self.instance_id).delete()
 
     def test_list(self):
         backups, marker = models.Backup.list(self.context)
         self.assertIsNone(marker)
         actual = [b.name for b in backups]
-        expected = [u'one', u'two', u'three', u'four']
+        expected = ['one', 'two', 'three', 'four']
         self.assertEqual(expected, actual)
 
     def test_list_for_instance(self):
@@ -554,5 +632,50 @@ class OrderingTests(trove_testtools.TestCase):
                                                           self.instance_id)
         self.assertIsNone(marker)
         actual = [b.name for b in backups]
-        expected = [u'one', u'two', u'three', u'four']
+        expected = ['one', 'two', 'three', 'four']
         self.assertEqual(expected, actual)
+
+
+class TestBackupStrategy(trove_testtools.TestCase):
+    def setUp(self):
+        super(TestBackupStrategy, self).setUp()
+        util.init_db()
+        self.context, self.instance_id = _prep_conf(timeutils.utcnow())
+
+    def test_create(self):
+        db_backstg = models.BackupStrategy.create(self.context,
+                                                  self.instance_id,
+                                                  'test-container')
+        self.addCleanup(models.BackupStrategy.delete, self.context,
+                        self.context.project_id, self.instance_id)
+
+        self.assertEqual('test-container', db_backstg.swift_container)
+
+    def test_list(self):
+        models.BackupStrategy.create(self.context, self.instance_id,
+                                     'test_list')
+        self.addCleanup(models.BackupStrategy.delete, self.context,
+                        self.context.project_id, self.instance_id)
+
+        db_backstgs = models.BackupStrategy.list(self.context,
+                                                 self.context.project_id,
+                                                 self.instance_id).all()
+
+        self.assertEqual(1, len(db_backstgs))
+        self.assertEqual('test_list', db_backstgs[0].swift_container)
+
+    def test_delete(self):
+        models.BackupStrategy.create(self.context, self.instance_id,
+                                     'test_delete')
+        db_backstgs = models.BackupStrategy.list(self.context,
+                                                 self.context.project_id,
+                                                 self.instance_id).all()
+        self.assertEqual(1, len(db_backstgs))
+
+        models.BackupStrategy.delete(self.context, self.context.project_id,
+                                     self.instance_id)
+
+        db_backstgs = models.BackupStrategy.list(self.context,
+                                                 self.context.project_id,
+                                                 self.instance_id).all()
+        self.assertEqual(0, len(db_backstgs))

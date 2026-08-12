@@ -11,54 +11,62 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+import json
 import os
-from tempfile import NamedTemporaryFile
 
-from cinderclient import exceptions as cinder_exceptions
-import cinderclient.v2.client as cinderclient
-from cinderclient.v2 import volumes as cinderclient_volumes
-import mock
-from mock import Mock, MagicMock, patch, PropertyMock, call
+from tempfile import NamedTemporaryFile
+from unittest import mock
+from unittest.mock import call
+from unittest.mock import MagicMock
+from unittest.mock import Mock
+from unittest.mock import patch
+from unittest.mock import PropertyMock
+
+import cinderclient.v3.client as cinderclient
 import neutronclient.v2_0.client as neutronclient
-from novaclient import exceptions as nova_exceptions
 import novaclient.v2.flavors
 import novaclient.v2.servers
+
+from cinderclient import exceptions as cinder_exceptions
+from cinderclient.v3 import volumes as cinderclient_volumes
+from novaclient import exceptions as nova_exceptions
 from oslo_config import cfg
 from swiftclient.client import ClientException
-from testtools.matchers import Equals, Is
+from testtools.matchers import Equals
+from testtools.matchers import Is
 
 import trove.backup.models
+import trove.common.context
+import trove.common.template as template
+import trove.db.models
+import trove.guestagent.api
+
 from trove.backup import models as backup_models
 from trove.backup import state
-import trove.common.context
+from trove.common import exception
 from trove.common.exception import GuestError
 from trove.common.exception import PollTimeOut
 from trove.common.exception import TroveError
-from trove.common.instance import ServiceStatuses
-from trove.common.notification import TroveInstanceModifyVolume
-import trove.common.template as template
 from trove.common import timeutils
 from trove.common import utils
 from trove.datastore import models as datastore_models
-import trove.db.models
 from trove.extensions.common import models as common_models
-from trove.extensions.mysql import models as mysql_models
-import trove.guestagent.api
 from trove.instance.models import BaseInstance
 from trove.instance.models import DBInstance
 from trove.instance.models import InstanceServiceStatus
 from trove.instance.models import InstanceStatus
+from trove.instance.service_status import ServiceStatuses
 from trove.instance.tasks import InstanceTasks
 from trove import rpc
 from trove.taskmanager import models as taskmanager_models
 from trove.tests.unittests import trove_testtools
-from trove.tests.unittests.util import util
 
 INST_ID = 'dbinst-id-1'
 VOLUME_ID = 'volume-id-1'
 
 
 class FakeOptGroup(object):
+
     def __init__(self, tcp_ports=['3306', '3301-3307'],
                  udp_ports=[], icmp=False):
         self.tcp_ports = tcp_ports
@@ -67,6 +75,7 @@ class FakeOptGroup(object):
 
 
 class fake_Server(object):
+
     def __init__(self):
         self.id = None
         self.name = None
@@ -74,17 +83,20 @@ class fake_Server(object):
         self.flavor_id = None
         self.files = None
         self.userdata = None
+        self.meta = None
         self.block_device_mapping_v2 = None
         self.status = 'HEALTHY'
         self.key_name = None
 
 
 class fake_ServerManager(object):
+
     def create(self, name, image_id, flavor_id, files, userdata,
                block_device_mapping_v2=None,
                availability_zone=None,
                nics=None, config_drive=False,
-               scheduler_hints=None, key_name=None):
+               scheduler_hints=None, key_name=None, meta=None,
+               tags=None):
         server = fake_Server()
         server.id = "server_id"
         server.name = name
@@ -96,11 +108,13 @@ class fake_ServerManager(object):
         server.availability_zone = availability_zone
         server.nics = nics
         server.key_name = key_name
-
+        server.meta = meta
+        server.tags = tags
         return server
 
 
 class fake_nova_client(object):
+
     def __init__(self):
         self.servers = fake_ServerManager()
 
@@ -205,7 +219,9 @@ class BaseFreshInstanceTasksTest(trove_testtools.TestCase):
             self.guestconfig = f.name
             f.write(self.guestconfig_content)
         self.freshinstancetasks = taskmanager_models.FreshInstanceTasks(
-            None, Mock(), None, None)
+            None, MagicMock(), None, None)
+        self.freshinstancetasks.context = trove.common.context.TroveContext(
+            user_id='test_user')
 
     def tearDown(self):
         super(BaseFreshInstanceTasksTest, self).tearDown()
@@ -237,39 +253,71 @@ class FreshInstanceTasksTest(BaseFreshInstanceTasksTest):
 
         self.assertEqual('fake_keypair', server.key_name)
 
+    def test_create_instance_prepare_cloud_config(self):
+        files = {"/tmp/fake_file": "fake text"}
+        user_data = self.freshinstancetasks.prepare_cloud_config(files)
+        self.assertTrue(user_data.startswith('#cloud-config'))
+
+    def test_create_instance_combine_cloudinit_userdata(self):
+        cloudcfg = """
+        #cloud-config
+        write_files:
+          - path: /etc/myconfig.conf
+            content: This is the content of the file.
+            owner: root:root
+            encoding: b64
+        """
+        userdata = """
+        #cloud-config
+        run_command:
+             - echo "hello world"
+        """
+        cloudinit = self.freshinstancetasks.combine_cloudinit_userdata(
+            cloudcfg, userdata)
+        self.assertTrue(cloudinit.startswith('#cloud-config'))
+        self.assertEqual(cloudinit.count('cloud-config'), 1)
+
     @patch.object(DBInstance, 'get_by')
     def test_create_instance_guestconfig(self, patch_get_by):
+        cfg.CONF.set_override('network_isolation', False, group='network')
+        self.addCleanup(cfg.CONF.clear_override, 'network_isolation',
+                        group='network')
         cfg.CONF.set_override('guest_config', self.guestconfig)
         cfg.CONF.set_override('guest_info', 'guest_info.conf')
         cfg.CONF.set_override('injected_config_location', '/etc/trove/conf.d')
+        cfg.CONF.set_override('docker_insecure_registries',
+                              '127.0.0.1:4000,127.0.0.1:5000')
 
         # execute
-        files = self.freshinstancetasks.get_injected_files("test")
+        files = self.freshinstancetasks.get_injected_files("test", 'test')
         # verify
-        self.assertTrue(
-            '/etc/trove/conf.d/guest_info.conf' in files)
-        self.assertTrue(
-            '/etc/trove/conf.d/trove-guestagent.conf' in files)
+        self.assertIn('/etc/trove/conf.d/guest_info.conf', files)
+        self.assertIn('/etc/trove/conf.d/trove-guestagent.conf', files)
         self.assertEqual(
             self.guestconfig_content,
             files['/etc/trove/conf.d/trove-guestagent.conf'])
+        deamon_json = json.loads(files.get('/etc/docker/daemon.json'))
+        self.assertIn('127.0.0.1:4000', deamon_json.get('insecure-registries'))
+        self.assertIn('127.0.0.1:5000', deamon_json.get('insecure-registries'))
 
     @patch.object(DBInstance, 'get_by')
     def test_create_instance_guestconfig_compat(self, patch_get_by):
+        cfg.CONF.set_override('network_isolation', False, group='network')
+        self.addCleanup(cfg.CONF.clear_override, 'network_isolation',
+                        group='network')
         cfg.CONF.set_override('guest_config', self.guestconfig)
         cfg.CONF.set_override('guest_info', '/etc/guest_info')
         cfg.CONF.set_override('injected_config_location', '/etc')
 
         # execute
-        files = self.freshinstancetasks.get_injected_files("test")
+        files = self.freshinstancetasks.get_injected_files("test", 'test')
         # verify
-        self.assertTrue(
-            '/etc/guest_info' in files)
-        self.assertTrue(
-            '/etc/trove-guestagent.conf' in files)
+        self.assertIn('/etc/guest_info', files)
+        self.assertIn('/etc/trove-guestagent.conf', files)
         self.assertEqual(
             self.guestconfig_content,
             files['/etc/trove-guestagent.conf'])
+        self.assertFalse(files.get('/etc/docker/daemon.json'))
 
     def test_create_instance_with_az_kwarg(self):
         # execute
@@ -295,14 +343,29 @@ class FreshInstanceTasksTest(BaseFreshInstanceTasksTest):
     @patch.object(taskmanager_models.FreshInstanceTasks, 'hostname',
                   new_callable=PropertyMock,
                   return_value='fake-hostname')
-    def test_servers_create_block_device_mapping_v2(self, mock_hostname):
-        self.freshinstancetasks._prepare_userdata = Mock(return_value=None)
+    @patch.object(taskmanager_models.FreshInstanceTasks, 'name',
+                  new_callable=PropertyMock,
+                  return_value='fake-name')
+    def test_servers_create_block_device_mapping_v2(self,
+                                                    mock_hostname,
+                                                    mock_name):
+        # This testcase is to test create_server with config_drive=True.
+        # We need set use_nova_server_config_drive True explicitly
+        # because use_nova_server_config_drive becomes False since Yoga
+        cfg.CONF.set_override('use_nova_server_config_drive', True)
+        self.freshinstancetasks.prepare_userdata = Mock(return_value=None)
         mock_nova_client = self.freshinstancetasks.nova_client = Mock()
         mock_servers_create = mock_nova_client.servers.create
         self.freshinstancetasks._create_server('fake-flavor', 'fake-image',
                                                'mysql', None, None, None)
+        meta = {'trove_project_id': self.freshinstancetasks.tenant_id,
+                'trove_user_id': 'test_user',
+                'trove_instance_id': self.freshinstancetasks.id}
+        tags = ['trove_instance', 'trove_mysql'] + [
+            f"{key}_{value}" for key, value in meta.items()
+        ]
         mock_servers_create.assert_called_with(
-            'fake-hostname', 'fake-image',
+            'fake-name', 'fake-image',
             'fake-flavor', files={},
             userdata=None,
             block_device_mapping_v2=None,
@@ -310,7 +373,49 @@ class FreshInstanceTasksTest(BaseFreshInstanceTasksTest):
             nics=None,
             config_drive=True,
             scheduler_hints=None,
-            key_name=None
+            key_name=None,
+            meta=meta,
+            tags=tags,
+        )
+
+    @patch.object(taskmanager_models.FreshInstanceTasks, 'hostname',
+                  new_callable=PropertyMock,
+                  return_value='fake-hostname')
+    @patch.object(taskmanager_models.FreshInstanceTasks, 'name',
+                  new_callable=PropertyMock,
+                  return_value='fake-name')
+    def test_servers_create_block_device_mapping_v2_since_yoga(
+            self, mock_hostname, mock_name):
+
+        # This testcase is for testing with config_drive=False.
+        self.freshinstancetasks.prepare_userdata = Mock(
+            return_value="#cloud-config\nwrite_files:\n")
+        mock_nova_client = self.freshinstancetasks.nova_client = Mock()
+        mock_servers_create = mock_nova_client.servers.create
+        self.freshinstancetasks._create_server('fake-flavor', 'fake-image',
+                                               'mysql', None, None, None)
+        meta = {'trove_project_id': self.freshinstancetasks.tenant_id,
+                'trove_user_id': 'test_user',
+                'trove_instance_id': self.freshinstancetasks.id}
+        tags = ['trove_instance', 'trove_mysql'] + [
+            f"{key}_{value}" for key, value in meta.items()
+        ]
+
+        userdata = self.freshinstancetasks.prepare_userdata('mysql')
+        userdata = userdata + \
+            self.freshinstancetasks.prepare_cloud_config({})
+        mock_servers_create.assert_called_with(
+            'fake-name', 'fake-image',
+            'fake-flavor', files={},
+            userdata=userdata,
+            block_device_mapping_v2=None,
+            availability_zone=None,
+            nics=None,
+            config_drive=False,
+            scheduler_hints=None,
+            key_name=None,
+            meta=meta,
+            tags=tags,
         )
 
     @patch.object(InstanceServiceStatus, 'find_by',
@@ -332,6 +437,7 @@ class FreshInstanceTasksTest(BaseFreshInstanceTasksTest):
     @patch.object(taskmanager_models.FreshInstanceTasks, '_create_server')
     @patch.object(taskmanager_models.FreshInstanceTasks, '_create_secgroup')
     @patch.object(taskmanager_models.FreshInstanceTasks, '_build_volume_info')
+    @patch.object(taskmanager_models.FreshInstanceTasks, '_create_root_volume')
     @patch.object(taskmanager_models.FreshInstanceTasks, '_guest_prepare')
     @patch.object(template, 'SingleInstanceConfigTemplate')
     @patch('trove.taskmanager.models.FreshInstanceTasks._create_port')
@@ -339,6 +445,7 @@ class FreshInstanceTasksTest(BaseFreshInstanceTasksTest):
                              mock_create_port,
                              mock_single_instance_template,
                              mock_guest_prepare,
+                             mock_create_root_volume,
                              mock_build_volume_info,
                              mock_create_secgroup,
                              mock_create_server,
@@ -367,24 +474,32 @@ class FreshInstanceTasksTest(BaseFreshInstanceTasksTest):
 
         mock_create_secgroup.assert_called_with('mysql', [])
         mock_create_port.assert_called_once_with(
-            'fake-net-id',
+            {'net-id': 'fake-net-id'},
             ['fake_security_group_id'],
             is_mgmt=False,
             is_public=False
         )
+        mock_get_injected_files.assert_called_once_with(
+            'mysql', None, networks=[{'port-id': 'fake-port-id'}])
+        image_id = 'mysql-image-id'
+        if cfg.CONF.volume_rootdisk_support:
+            mock_create_root_volume.assert_called_with(
+                'mysql-image-id', 10, 'volume_type', None)
+            image_id = None
+
         mock_build_volume_info.assert_called_with(
-            'mysql', volume_size=2,
-            volume_type='volume_type'
+            'mysql', availability_zone=None, volume_size=2,
+            volume_type='volume_type', snapshot_id=None
         )
         mock_guest_prepare.assert_called_with(
             768, mock_build_volume_info(), 'mysql-server', None, None, None,
-            config_content, None, overrides, None, None, None
+            config_content, None, overrides, None, None, None, ds_version=None
         )
         mock_create_server.assert_called_with(
-            8, 'mysql-image-id', 'mysql',
+            8, image_id, 'mysql',
             mock_build_volume_info()['block_device'], None,
             [{'port-id': 'fake-port-id'}],
-            mock_get_injected_files(),
+            mock_get_injected_files.return_value,
             {'group': 'sg-id'}
         )
 
@@ -393,6 +508,7 @@ class FreshInstanceTasksTest(BaseFreshInstanceTasksTest):
     @patch.object(taskmanager_models.FreshInstanceTasks, 'get_injected_files')
     @patch.object(taskmanager_models.FreshInstanceTasks, '_create_server')
     @patch.object(taskmanager_models.FreshInstanceTasks, '_build_volume_info')
+    @patch.object(taskmanager_models.FreshInstanceTasks, '_create_root_volume')
     @patch.object(taskmanager_models.FreshInstanceTasks, '_guest_prepare')
     @patch.object(template, 'SingleInstanceConfigTemplate')
     @patch('trove.common.clients_admin.neutron_client_trove_admin')
@@ -400,24 +516,40 @@ class FreshInstanceTasksTest(BaseFreshInstanceTasksTest):
                                             mock_neutron_client,
                                             mock_single_instance_template,
                                             mock_guest_prepare,
+                                            mock_create_root_volume,
                                             mock_build_volume_info,
                                             mock_create_server,
                                             mock_get_injected_files,
                                             *args):
         self.patch_conf_property('management_networks', ['fake-mgmt-uuid'])
 
-        mock_client = Mock()
+        mock_client = MagicMock()
         mock_client.create_security_group.return_value = {
             'security_group': {'id': 'fake-sg-id'}
         }
         mock_client.create_port.side_effect = [
             {'port': {'id': 'fake-mgmt-port-id'}},
-            {'port': {'id': 'fake-user-port-id'}}
+            {
+                'port': {
+                    'id': 'fake-user-port-id',
+                    'fixed_ips': [{'subnet_id': 'fake-subnet-id'}]
+                }
+            }
         ]
         mock_client.list_networks.return_value = {
             'networks': [{'id': 'fake-public-net-id'}]
         }
+        mock_client.list_ports.return_value = {
+            'ports': [{'id': 'fake-port-id'}]
+        }
+        mock_client.show_port.return_value = {
+            'port': {
+                'mac_address': '00:00:00:00:00:0',
+                'fixed_ips': []
+            }
+        }
         mock_neutron_client.return_value = mock_client
+
         mock_flavor = {'id': 8, 'ram': 768, 'name': 'bigger_flavor'}
         config_content = {'config_contents': 'some junk'}
         mock_single_instance_template.return_value.config_contents = (
@@ -434,26 +566,38 @@ class FreshInstanceTasksTest(BaseFreshInstanceTasksTest):
             access={'is_public': True, 'allowed_cidrs': ['192.168.0.1/24']}
         )
 
+        image_id = 'mysql-image-id'
+        if cfg.CONF.volume_rootdisk_support:
+            mock_create_root_volume.assert_called_with(
+                'mysql-image-id', 10, 'volume_type', None)
+            image_id = None
         mock_build_volume_info.assert_called_with(
-            'mysql', volume_size=2,
-            volume_type='volume_type'
+            'mysql', availability_zone=None, volume_size=2,
+            volume_type='volume_type', snapshot_id=None
         )
         mock_guest_prepare.assert_called_with(
             768, mock_build_volume_info(), 'mysql-server', None, None, None,
-            config_content, None, mock.ANY, None, None, None)
+            config_content, None, mock.ANY, None, None, None, ds_version=None)
         mock_create_server.assert_called_with(
-            8, 'mysql-image-id', 'mysql',
+            8, image_id, 'mysql',
             mock_build_volume_info()['block_device'], None,
             [
                 {'port-id': 'fake-user-port-id'},
                 {'port-id': 'fake-mgmt-port-id'}
             ],
-            mock_get_injected_files(), {'group': 'sg-id'}
+            mock_get_injected_files.return_value, {'group': 'sg-id'}
         )
+        mock_get_injected_files.assert_called_once_with(
+            'mysql', None,
+            networks=[
+                {'port-id': 'fake-user-port-id'},
+                {'port-id': 'fake-mgmt-port-id'}
+            ])
         create_floatingip_param = {
             "floatingip": {
                 'floating_network_id': 'fake-public-net-id',
                 'port_id': 'fake-user-port-id',
+                'project_id': mock.ANY
             }
         }
         mock_client.create_floatingip.assert_called_once_with(
@@ -571,6 +715,7 @@ class ResizeVolumeTest(trove_testtools.TestCase):
                                                             self.new_vol_size)
 
         class FakeGroup(object):
+
             def __init__(self):
                 self.mount_point = 'var/lib/mysql'
                 self.device_path = '/dev/vdb'
@@ -622,11 +767,10 @@ class ResizeVolumeTest(trove_testtools.TestCase):
         self.instance.volume_client.volumes.extend.side_effect = None
         self.instance.reset_mock()
 
-    @patch('trove.taskmanager.models.LOG')
-    def test_resize_volume_verify_extend_no_volume(self, mock_logging):
+    def test_resize_volume_verify_extend_no_volume(self):
         self.instance.volume_client.volumes.get = Mock(
             return_value=None)
-        self.assertRaises(cinder_exceptions.ClientException,
+        self.assertRaises(exception.TroveError,
                           self.action._verify_extend)
         self.instance.reset_mock()
 
@@ -638,31 +782,41 @@ class ResizeVolumeTest(trove_testtools.TestCase):
         utils.poll_until.side_effect = None
         self.instance.reset_mock()
 
-    @patch.object(TroveInstanceModifyVolume, 'notify')
     def test_resize_volume_active_server_succeeds(self, *args):
         server = Mock(status=InstanceStatus.ACTIVE)
         self.instance.attach_mock(server, 'server')
+
         self.action.execute()
-        self.assertEqual(1, self.instance.guest.stop_db.call_count)
-        self.assertEqual(1, self.instance.guest.unmount_volume.call_count)
-        detach_count = (
-            self.instance.nova_client.volumes.delete_server_volume.call_count)
-        self.assertEqual(1, detach_count)
+
         extend_count = self.instance.volume_client.volumes.extend.call_count
         self.assertEqual(1, extend_count)
-        attach_count = (
-            self.instance.nova_client.volumes.create_server_volume.call_count)
-        self.assertEqual(1, attach_count)
-        self.assertEqual(1, self.instance.guest.resize_fs.call_count)
-        self.assertEqual(1, self.instance.guest.mount_volume.call_count)
-        self.assertEqual(1, self.instance.restart.call_count)
         self.instance.reset_mock()
 
     def test_resize_volume_server_error_fails(self):
         server = Mock(status=InstanceStatus.ERROR)
         self.instance.attach_mock(server, 'server')
+
         self.assertRaises(TroveError, self.action.execute)
         self.instance.reset_mock()
+
+
+class RebuildActionTest(trove_testtools.TestCase):
+
+    def test_execute_unmounts_volume(self):
+        instance = Mock()
+        instance.db_info.task_status = InstanceTasks.NONE
+        action = taskmanager_models.RebuildAction(instance, 'image-id')
+
+        with (
+            patch.object(action, '_unmount_volume') as unmount_volume,
+            patch.object(action, '_wait_for_nova_action'),
+            patch.object(action, '_assert_nova_action_was_successful'),
+            patch.object(action, '_assert_processes_are_ok'),
+            patch.object(action, '_record_action_success'),
+        ):
+            action.execute()
+
+        unmount_volume.assert_called_once_with()
 
 
 class BuiltInstanceTasksTest(trove_testtools.TestCase):
@@ -700,10 +854,14 @@ class BuiltInstanceTasksTest(trove_testtools.TestCase):
                               {'ip_address': 'fd4a:7bef:d1ed:1::1'}],
                 'id': 'fake-port-id'}]})
 
+    def _poll_until_no_delay(self, *args, **kwargs):
+        kwargs['initial_delay'] = 0
+        return self.real_poll_until(*args, **kwargs)
+
     def setUp(self):
         super(BuiltInstanceTasksTest, self).setUp()
         self.new_flavor = {'id': 8, 'ram': 768, 'name': 'bigger_flavor'}
-        stub_nova_server = MagicMock()
+        stub_nova_server = MagicMock(id='fake_id')
         self.rpc_patches = patch.multiple(
             rpc, get_notifier=MagicMock(), get_client=MagicMock())
         self.rpc_mocks = self.rpc_patches.start()
@@ -725,9 +883,17 @@ class BuiltInstanceTasksTest(trove_testtools.TestCase):
         # this is used during the final check of whether the resize successful
         db_instance.server_status = 'HEALTHY'
         self.db_instance = db_instance
+        datastore_version = MagicMock(
+            spec=datastore_models.DatastoreVersion)
+        datastore_version.id = '1'
+        datastore_version.name = '5.7'
+        datastore_version.version = '5.7'
+        datastore_version.datastore_id = 'id-1'
+        datastore_version.manager = 'mysql'
+        datastore_version.datastore_name = 'mysql'
         self.dm_dv_load_by_uuid_patch = patch.object(
             datastore_models.DatastoreVersion, 'load_by_uuid', MagicMock(
-                return_value=datastore_models.DatastoreVersion(db_instance)))
+                return_value=datastore_version))
         self.dm_dv_load_by_uuid_mock = self.dm_dv_load_by_uuid_patch.start()
         self.addCleanup(self.dm_dv_load_by_uuid_patch.stop)
         self.dm_ds_load_patch = patch.object(
@@ -754,6 +920,7 @@ class BuiltInstanceTasksTest(trove_testtools.TestCase):
         self.stub_running_server.flavor = {'id': 6, 'ram': 512}
         self.stub_verifying_server = MagicMock(
             spec=novaclient.v2.servers.Server)
+        self.stub_verifying_server.id = 'fake_id'
         self.stub_verifying_server.status = 'VERIFY_RESIZE'
         self.stub_verifying_server.flavor = {'id': 8, 'ram': 768}
         self.stub_server_mgr.get = MagicMock(
@@ -813,24 +980,30 @@ class BuiltInstanceTasksTest(trove_testtools.TestCase):
                 'public_ips' in self._testMethodName):
             self._stub_neutron_client()
 
+        self.real_poll_until = utils.poll_until
+
     def tearDown(self):
         super(BuiltInstanceTasksTest, self).tearDown()
 
-    def test_resize_flavor(self):
+    @patch('trove.common.utils.poll_until')
+    def test_resize_flavor(self, mock_poll_until):
+        mock_poll_until.side_effect = self._poll_until_no_delay
         orig_server = self.instance_task.server
         self.instance_task.resize_flavor({'id': 1, 'ram': 512},
                                          self.new_flavor)
         # verify
         self.assertIsNot(self.instance_task.server, orig_server)
-        self.instance_task._guest.stop_db.assert_any_call(
-            do_not_start_on_reboot=True)
+        self.assertEqual(1, self.instance_task._guest.stop_db.call_count)
         orig_server.resize.assert_any_call(self.new_flavor['id'])
         self.assertThat(self.db_instance.task_status, Is(InstanceTasks.NONE))
-        self.assertEqual(1, self.stub_server_mgr.get.call_count)
+        self.assertEqual(2, self.stub_server_mgr.get.call_count)
         self.assertThat(self.db_instance.flavor_id, Is(self.new_flavor['id']))
 
+    @patch('trove.common.utils.poll_until')
     @patch('trove.taskmanager.models.LOG')
-    def test_resize_flavor_resize_failure(self, mock_logging):
+    def test_resize_flavor_resize_failure(self, mock_logging, mock_poll_until):
+        mock_poll_until.side_effect = self._poll_until_no_delay
+
         orig_server = self.instance_task.server
         self.stub_verifying_server.status = 'ERROR'
         with patch.object(self.instance_task._nova_client.servers, 'get',
@@ -842,8 +1015,7 @@ class BuiltInstanceTasksTest(trove_testtools.TestCase):
             self.assertTrue(self.stub_server_mgr.get.called)
             self.assertIs(self.instance_task.server,
                           self.stub_verifying_server)
-            self.instance_task._guest.stop_db.assert_any_call(
-                do_not_start_on_reboot=True)
+            self.assertEqual(1, self.instance_task._guest.stop_db.call_count)
             orig_server.resize.assert_any_call(self.new_flavor['id'])
             self.assertThat(self.db_instance.task_status,
                             Is(InstanceTasks.NONE))
@@ -852,11 +1024,12 @@ class BuiltInstanceTasksTest(trove_testtools.TestCase):
     @patch.object(utils, 'poll_until')
     def test_reboot(self, mock_poll):
         self.instance_task.server.reboot = Mock()
-        self.instance_task.set_datastore_status_to_paused = Mock()
+
         self.instance_task.reboot()
+
         self.instance_task._guest.stop_db.assert_any_call()
         self.instance_task.server.reboot.assert_any_call()
-        self.instance_task.set_datastore_status_to_paused.assert_any_call()
+        self.instance_task._guest.restart.assert_any_call()
 
     @patch.object(BaseInstance, 'update_db')
     def test_detach_replica(self, mock_update_db):
@@ -916,7 +1089,7 @@ class BuiltInstanceTasksTest(trove_testtools.TestCase):
                           return_value=replica_config):
             self.instance_task.attach_replica(master)
         self.instance_task._guest.attach_replica.assert_called_with(
-            replica_context, config_content)
+            replica_context, config_content, restart=False)
         mock_update_db.assert_called_with(slave_of_id=master.id)
 
     @patch('trove.taskmanager.models.LOG')
@@ -925,34 +1098,6 @@ class BuiltInstanceTasksTest(trove_testtools.TestCase):
                           side_effect=GuestError):
             self.assertRaises(GuestError, self.instance_task.attach_replica,
                               Mock())
-
-    def test_get_floating_ips(self):
-        floating_ips = self.instance_task._get_floating_ips()
-        self.assertEqual({'192.168.10.1': 'fake-floatingip-id'},
-                         floating_ips)
-
-    @patch.object(BaseInstance, 'get_visible_ip_addresses',
-                  return_value=['192.168.10.1'])
-    def test_detach_public_ips(self, mock_address):
-        removed_ips = self.instance_task.detach_public_ips()
-        self.assertEqual(['fake-floatingip-id'], removed_ips)
-        mock_update_floatingip = (self.instance_task.neutron_client
-                                  .update_floatingip)
-        mock_update_floatingip.assert_called_once_with(
-            removed_ips[0], {'floatingip': {'port_id': None}})
-
-    def test_attach_public_ips(self):
-        self.instance_task.attach_public_ips(['fake-floatingip-id'])
-        mock_list_ports = (self.instance_task.neutron_client
-                           .list_ports)
-        mock_list_ports.assert_called_once_with(device_id='computeinst-id-1')
-
-        mock_update_floatingip = (self.instance_task.neutron_client
-                                  .update_floatingip)
-        mock_update_floatingip.assert_called_once_with(
-            'fake-floatingip-id',
-            {'floatingip': {'port_id': 'fake-port-id',
-                            'fixed_ip_address': '10.0.0.1'}})
 
     @patch.object(BaseInstance, 'update_db')
     def test_enable_as_master(self, mock_update_db):
@@ -991,27 +1136,20 @@ class BuiltInstanceTasksTest(trove_testtools.TestCase):
         self.instance_task.demote_replication_master()
         self.instance_task._guest.demote_replication_master.assert_any_call()
 
-    @patch.multiple(taskmanager_models.BuiltInstanceTasks,
-                    get_injected_files=Mock(return_value="the-files"))
-    def test_upgrade(self, *args):
-        pre_rebuild_server = self.instance_task.server
-        dsv = Mock(image_id='foo_image')
-        mock_volume = Mock(attachments=[{'device': '/dev/mock_dev'}])
-        with patch.object(self.instance_task._volume_client.volumes, "get",
-                          Mock(return_value=mock_volume)):
-            mock_server = Mock(status='ACTIVE')
-            with patch.object(self.instance_task._nova_client.servers,
-                              'get', Mock(return_value=mock_server)):
-                with patch.multiple(self.instance_task._guest,
-                                    pre_upgrade=Mock(return_value={}),
-                                    post_upgrade=Mock()):
-                    self.instance_task.upgrade(dsv)
+    @patch('trove.taskmanager.models.BuiltInstanceTasks.set_service_status')
+    @patch('trove.taskmanager.models.BuiltInstanceTasks.is_service_healthy')
+    @patch('trove.taskmanager.models.BuiltInstanceTasks.reset_task_status')
+    def test_upgrade(self, mock_resetstatus, mock_check, mock_setstatus):
+        dsv = MagicMock()
+        attrs = {'name': 'new_name', 'version': 'new_version'}
+        dsv.configure_mock(**attrs)
+        mock_check.return_value = True
+        self.instance_task._guest.pre_upgrade.return_value = {}
 
-                    self.instance_task._guest.pre_upgrade.assert_called_with()
-                    pre_rebuild_server.rebuild.assert_called_with(
-                        dsv.image_id, files="the-files")
-                    self.instance_task._guest.post_upgrade.assert_called_with(
-                        mock_volume.attachments[0])
+        self.instance_task.upgrade(dsv)
+
+        self.instance_task._guest.upgrade.assert_called_once_with(
+            {'datastore_version': 'new_version'})
 
     def test_fix_device_path(self):
         self.assertEqual("/dev/vdb", self.instance_task.
@@ -1030,12 +1168,13 @@ class BackupTasksTest(trove_testtools.TestCase):
         self.backup.id = 'backup_id'
         self.backup.name = 'backup_test',
         self.backup.description = 'test desc'
-        self.backup.location = 'http://xxx/z_CLOUD/12e48.xbstream.gz'
+        self.backup.location = 'http://xxx/z_CLOUD/container/12e48.xbstream.gz'
         self.backup.instance_id = 'instance id'
         self.backup.created = 'yesterday'
         self.backup.updated = 'today'
         self.backup.size = 2.0
         self.backup.state = state.BackupState.NEW
+        self.backup.storage_driver = 'backup'
         self.bm_backup_patches = patch.multiple(
             backup_models.Backup,
             delete=MagicMock(return_value=None),
@@ -1056,12 +1195,11 @@ class BackupTasksTest(trove_testtools.TestCase):
         self.backup.location = ''
         taskmanager_models.BackupTasks.delete_backup('dummy context',
                                                      self.backup.id)
-        self.backup.delete.assert_any_call()
 
-    @patch('trove.taskmanager.models.LOG')
+        self.assertTrue(self.backup.deleted)
+
     @patch('trove.common.clients.create_swift_client')
-    def test_delete_backup_fail_delete_manifest(self, mock_swift_client,
-                                                mock_logging):
+    def test_delete_backup_fail_delete_manifest(self, mock_swift_client):
         client_mock = MagicMock()
         client_mock.head_object.return_value = {}
         client_mock.delete_object.side_effect = ClientException("foo")
@@ -1078,6 +1216,24 @@ class BackupTasksTest(trove_testtools.TestCase):
             self.backup.state,
             "backup should be in DELETE_FAILED status"
         )
+
+    @patch('trove.common.clients.create_swift_client')
+    def test_delete_backup_delete_swift(self, mock_swift_client):
+        client_mock = MagicMock()
+        mock_swift_client.return_value = client_mock
+
+        taskmanager_models.BackupTasks.delete_backup(mock.ANY, self.backup.id)
+
+        client_mock.head_object.assert_called_once_with('container',
+                                                        '12e48.xbstream.gz')
+        client_mock.delete_object.assert_called_once_with('container',
+                                                          '12e48.xbstream.gz')
+
+    def test_delete_backup_restored(self):
+        self.backup.state = state.BackupState.RESTORED
+        taskmanager_models.BackupTasks.delete_backup(mock.ANY, self.backup.id)
+
+        self.assertTrue(self.backup.deleted)
 
     def test_parse_manifest(self):
         manifest = 'container/prefix'
@@ -1105,6 +1261,7 @@ class BackupTasksTest(trove_testtools.TestCase):
 
 
 class NotifyMixinTest(trove_testtools.TestCase):
+
     def test_get_service_id(self):
         id_map = {
             'mysql': '123',
@@ -1128,29 +1285,36 @@ class RootReportTest(trove_testtools.TestCase):
 
     def setUp(self):
         super(RootReportTest, self).setUp()
-        util.init_db()
 
     def tearDown(self):
         super(RootReportTest, self).tearDown()
 
     def test_report_root_first_time(self):
         context = Mock()
-        context.user = utils.generate_uuid()
-        report = mysql_models.RootHistory.create(
+        context.user_id = utils.generate_uuid()
+        report = common_models.RootHistory.create(
             context, utils.generate_uuid())
         self.assertIsNotNone(report)
 
     def test_report_root_double_create(self):
         context = Mock()
-        context.user = utils.generate_uuid()
+        context.user_id = utils.generate_uuid()
         id = utils.generate_uuid()
-        history = mysql_models.RootHistory(id, context.user).save()
-        with patch.object(mysql_models.RootHistory, 'load',
+        history = common_models.RootHistory(id, context.user_id).save()
+        with patch.object(common_models.RootHistory, 'load',
                           Mock(return_value=history)):
-            report = mysql_models.RootHistory.create(context, id)
-            self.assertTrue(mysql_models.RootHistory.load.called)
+            report = common_models.RootHistory.create(context, id)
+            self.assertTrue(common_models.RootHistory.load.called)
             self.assertEqual(history.user, report.user)
             self.assertEqual(history.id, report.id)
+
+    def test_report_root_delete(self):
+        context = Mock()
+        context.user_id = utils.generate_uuid()
+        report = common_models.RootHistory.create(
+            context, utils.generate_uuid())
+        report.delete()
+        self.assertIsNotNone(report.deleted_at)
 
 
 class ClusterRootTest(trove_testtools.TestCase):
@@ -1159,7 +1323,7 @@ class ClusterRootTest(trove_testtools.TestCase):
     @patch.object(common_models.Root, "create")
     def test_cluster_root_create(self, root_create, root_history_create):
         context = Mock()
-        context.user = utils.generate_uuid()
+        context.user_id = utils.generate_uuid()
         id = utils.generate_uuid()
         password = "rootpassword"
         cluster_instances = [utils.generate_uuid(), utils.generate_uuid()]

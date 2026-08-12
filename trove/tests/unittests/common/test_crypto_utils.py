@@ -14,9 +14,9 @@
 #    under the License.
 #
 
-import mock
 import os
-import six
+from unittest import mock
+
 
 from trove.common import crypto_utils
 from trove.tests.unittests import trove_testtools
@@ -33,12 +33,12 @@ class TestEncryptUtils(trove_testtools.TestCase):
     def test_encode_decode_string(self):
         random_data = bytearray(os.urandom(12))
         data = [b'abc', b'numbers01234', b'\x00\xFF\x00\xFF\xFF\x00',
-                random_data, u'Unicode:\u20ac']
+                random_data, 'Unicode:\u20ac']
 
         for datum in data:
             encoded_data = crypto_utils.encode_data(datum)
             decoded_data = crypto_utils.decode_data(encoded_data)
-            if isinstance(datum, six.text_type):
+            if isinstance(datum, str):
                 decoded_data = decoded_data.decode('utf-8')
             self. assertEqual(datum, decoded_data,
                               "Encode/decode failed")
@@ -81,7 +81,7 @@ class TestEncryptUtils(trove_testtools.TestCase):
                     'P/RRPT'),
 
                 # Unicoded string (encoded to UTF-8)
-                (u'Unicode:\u20ac',
+                ('Unicode:\u20ac',
                  'eHh4eHh4eHh4eHh4eHh4eAMsI5YsrtMNAPJfVF0j9NegXML7OsJ0LuAy66'
                     'LKv5F4'),
             ):
@@ -99,7 +99,7 @@ class TestEncryptUtils(trove_testtools.TestCase):
                 'KNN0NH',
              b'Hello World!'),
 
-            # Unicoded string: u'Unicode:\u20ac'
+            # Unicoded string: 'Unicode:\u20ac'
             ('ZUhoNGVIaDRlSGg0ZUhoNIHZLIuIcQCRwWY7PR2y7JcqoDf4ViqXIfh0uE'
                 'Rbg9BA',
              b'Unicode:\xe2\x82\xac'),

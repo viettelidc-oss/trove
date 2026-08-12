@@ -15,17 +15,17 @@
 
 import abc
 import ast
+import configparser
 import csv
-import json
+import io
 import re
-import sys
 
-import six
-from six.moves import configparser
 import xmltodict
 import yaml
 
 from oslo_serialization import base64
+from oslo_serialization import jsonutils
+from oslo_utils import strutils
 
 from trove.common import utils as trove_utils
 
@@ -72,7 +72,7 @@ class StringConverter(object):
         # Return known mappings and quoted strings right away.
         if value in self._object_mappings:
             return self._object_mappings[value]
-        elif (isinstance(value, six.string_types) and
+        elif (isinstance(value, str) and
               re.match("^'(.*)'|\"(.*)\"$", value)):
             return value
 
@@ -82,8 +82,7 @@ class StringConverter(object):
             return value
 
 
-@six.add_metaclass(abc.ABCMeta)
-class StreamCodec(object):
+class StreamCodec(object, metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def serialize(self, data):
@@ -200,14 +199,14 @@ class IniCodec(StreamCodec):
 
     def serialize(self, dict_data):
         parser = self._init_config_parser(dict_data)
-        output = six.StringIO()
+        output = io.StringIO()
         parser.write(output)
 
         return output.getvalue()
 
     def deserialize(self, stream):
         parser = self._init_config_parser()
-        parser.readfp(self._pre_parse(stream))
+        parser.read_file(self._pre_parse(stream))
 
         return {s: {k:
                     StringConverter({None: self._default_value}).to_objects(v)
@@ -215,8 +214,8 @@ class IniCodec(StreamCodec):
                 for s in parser.sections()}
 
     def _pre_parse(self, stream):
-        buf = six.StringIO()
-        for line in six.StringIO(stream):
+        buf = io.StringIO()
+        for line in io.StringIO(stream):
             # Ignore commented lines.
             if not line.startswith(self._comment_markers):
                 # Strip leading and trailing whitespaces from each line.
@@ -229,11 +228,7 @@ class IniCodec(StreamCodec):
         return buf
 
     def _init_config_parser(self, sections=None):
-        # SafeConfigParser was deprecated in Python 3.2
-        if sys.version_info >= (3, 2):
-            parser = configparser.ConfigParser(allow_no_value=True)
-        else:
-            parser = configparser.SafeConfigParser(allow_no_value=True)
+        parser = configparser.ConfigParser(allow_no_value=True)
         if sections:
             for section in sections:
                 parser.add_section(section)
@@ -282,7 +277,7 @@ class PropertiesCodec(StreamCodec):
         :type comment_markers:    list
 
         :param unpack_singletons: Whether to unpack singleton collections
-                                  (collections with only a single value).
+                                  (collections with only a single item).
         :type unpack_singletons:  boolean
 
         :param string_mappings:   User-defined string representations of
@@ -295,7 +290,7 @@ class PropertiesCodec(StreamCodec):
         self._unpack_singletons = unpack_singletons
 
     def serialize(self, dict_data):
-        output = six.StringIO()
+        output = io.StringIO()
         writer = csv.writer(output, delimiter=self._delimiter,
                             quoting=self.QUOTING_MODE,
                             strict=self.STRICT_MODE,
@@ -307,7 +302,7 @@ class PropertiesCodec(StreamCodec):
         return output.getvalue()
 
     def deserialize(self, stream):
-        reader = csv.reader(six.StringIO(stream),
+        reader = csv.reader(io.StringIO(stream),
                             delimiter=self._delimiter,
                             quoting=self.QUOTING_MODE,
                             strict=self.STRICT_MODE,
@@ -452,10 +447,7 @@ class KeyValueCodec(StreamCodec):
         # Note(zhaochao): In Python 3, when files are opened in text mode,
         # newlines will be translated to '\n' by default, so we just split
         # the stream by '\n'.
-        if sys.version_info[0] >= 3:
-            lines = stream.split('\n')
-        else:
-            lines = stream.split(self._line_terminator)
+        lines = stream.split('\n')
 
         result = {}
         for line in lines:
@@ -469,6 +461,8 @@ class KeyValueCodec(StreamCodec):
                 v = v.lstrip(
                     self._value_quote_char).rstrip(
                     self._value_quote_char)
+            elif v.lower() in ['true', 'false']:
+                v = strutils.bool_from_string(v.lower())
             else:
                 # remove trailing comments
                 v = re.sub('%s.*$' % self._comment_marker, '', v)
@@ -494,6 +488,8 @@ class KeyValueCodec(StreamCodec):
             return False
         if isinstance(value, bool) or isinstance(value, int):
             return False
+        if isinstance(value, float):
+            return False
         if value.lower() in ['true', 'false']:
             return False
         try:
@@ -509,10 +505,13 @@ class KeyValueCodec(StreamCodec):
 class JsonCodec(StreamCodec):
 
     def serialize(self, dict_data):
-        return json.dumps(dict_data)
+        return jsonutils.dumps(dict_data)
 
     def deserialize(self, stream):
-        return json.load(six.StringIO(stream))
+        if isinstance(stream, str):
+            return jsonutils.load(io.StringIO(stream))
+        if isinstance(stream, bytes):
+            return jsonutils.load(io.BytesIO(stream))
 
 
 class Base64Codec(StreamCodec):

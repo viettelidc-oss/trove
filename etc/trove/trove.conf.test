@@ -50,7 +50,6 @@ nova_compute_service_type = compute
 nova_service_name = Compute Service
 
 # Config option for showing the IP address that nova doles out
-network_label_regex = ^private$
 ip_regex = ^(15.|123.)
 black_list_regex = ^(10.0.0.)
 
@@ -73,9 +72,6 @@ http_delete_rate = 500
 
 # default datastore
 default_datastore = a00000a0-00a0-0a00-00a0-000a000000aa
-
-# Auth
-admin_roles = admin
 
 # Users to ignore for user create/list/delete operations
 ignore_users = os_admin, root
@@ -136,7 +132,7 @@ connection = sqlite:///trove_test.sqlite
 # idle connections. This can result in 'MySQL Gone Away' exceptions. If you
 # notice this, you can lower this value to ensure that SQLAlchemy reconnects
 # before MySQL can drop the connection.
-idle_timeout = 3600
+connection_recycle_time = 3600
 
 [composite:trove]
 use = call:trove.common.wsgi:versioned_urlmap

@@ -17,7 +17,6 @@
 Handles all request to the Platform or Guest VM
 """
 
-from eventlet import Timeout
 from oslo_log import log as logging
 import oslo_messaging as messaging
 from oslo_messaging.rpc.client import RemoteError
@@ -36,13 +35,17 @@ class API(object):
 
     API version history:
         * 1.0 - Initial version.
+        * 1.1 - Added argement ds_version to prepare and
+                start_db_with_conf_changes
+              - Remove do_not_start_on_reboot from stop_db
+              - Added online argument to resize_fs
 
     When updating this API, also update API_LATEST_VERSION
     """
 
     # API_LATEST_VERSION should bump the minor number each time
     # a method signature is added or changed
-    API_LATEST_VERSION = '1.0'
+    API_LATEST_VERSION = '1.3'
 
     # API_BASE_VERSION should only change on major version upgrade
     API_BASE_VERSION = '1.0'
@@ -54,6 +57,10 @@ class API(object):
         'liberty': '1.0',
         'mitaka': '1.0',
         'newton': '1.0',
+        'ussuri': '1.0',
+        'victoria': '1.1',
+        'epoxy': '1.2',
+        'hibiscus': '1.3',
 
         'latest': API_LATEST_VERSION
     }
@@ -94,11 +101,12 @@ class API(object):
         except RemoteError as r:
             LOG.exception("Error calling %s", method_name)
             raise exception.GuestError(original_message=r.value)
+        except messaging.MessagingTimeout:
+            LOG.exception("Timeout calling %s", method_name)
+            raise exception.GuestTimeout()
         except Exception as e:
             LOG.exception("Error calling %s", method_name)
             raise exception.GuestError(original_message=str(e))
-        except Timeout:
-            raise exception.GuestTimeout()
 
     def _cast(self, method_name, version, **kwargs):
         LOG.debug("Calling %s asynchronously", method_name)
@@ -314,13 +322,13 @@ class API(object):
                 device_path='/dev/vdb', mount_point='/mnt/volume',
                 backup_info=None, config_contents=None, root_password=None,
                 overrides=None, cluster_config=None, snapshot=None,
-                modules=None):
+                modules=None, ds_version=None):
         """Make an asynchronous call to prepare the guest
            as a database container optionally includes a backup id for restores
         """
         LOG.debug("Sending the call to prepare the Guest.")
 
-        version = self.API_BASE_VERSION
+        version = '1.1'
 
         # Taskmanager is a publisher, guestagent is a consumer. Usually
         # consumer creates a queue, but in this case we have to make sure
@@ -328,14 +336,21 @@ class API(object):
         # didn't create a queue on time.
         self._create_guest_queue()
 
-        packages = packages.split()
-        self._cast(
-            "prepare", version=version, packages=packages,
-            databases=databases, memory_mb=memory_mb, users=users,
-            device_path=device_path, mount_point=mount_point,
+        if packages:
+            packages = packages.split()
+
+        prepare_args = dict(
+            packages=packages, databases=databases, memory_mb=memory_mb,
+            users=users, device_path=device_path, mount_point=mount_point,
             backup_info=backup_info, config_contents=config_contents,
             root_password=root_password, overrides=overrides,
-            cluster_config=cluster_config, snapshot=snapshot, modules=modules)
+            cluster_config=cluster_config, snapshot=snapshot, modules=modules,
+            ds_version=ds_version)
+
+        if not self.client.can_send_version(version):
+            prepare_args.pop('ds_version')
+            version = '1.0'
+        self._cast("prepare", version=version, **prepare_args)
 
     def _create_guest_queue(self):
         """Call to construct, start and immediately stop rpc server in order
@@ -379,6 +394,14 @@ class API(object):
                    self.agent_high_timeout, version=version,
                    upgrade_info=upgrade_info)
 
+    def upgrade(self, upgrade_info):
+        """Upgrade database service."""
+        LOG.debug("Sending the call to upgrade database service.")
+        version = self.API_BASE_VERSION
+
+        return self._cast("upgrade", version=version,
+                          upgrade_info=upgrade_info)
+
     def restart(self):
         """Restart the database server."""
         LOG.debug("Sending the call to restart the database process "
@@ -387,19 +410,30 @@ class API(object):
 
         self._call("restart", self.agent_high_timeout, version=version)
 
-    def start_db_with_conf_changes(self, config_contents):
-        """Start the database server."""
+    def start_db_with_conf_changes(self, config_contents, ds_version):
+        """Start the database with given configuration.
+
+        This method is called after resize.
+        """
         LOG.debug("Sending the call to start the database process on "
                   "the Guest with a timeout of %s.",
                   self.agent_high_timeout)
-        version = self.API_BASE_VERSION
+        start_args = dict(config_contents=config_contents,
+                          ds_version=ds_version)
+
+        version = '1.1'
+        if not self.client.can_send_version(version):
+            start_args.pop('ds_version')
+            version = '1.0'
 
         self._call("start_db_with_conf_changes", self.agent_high_timeout,
-                   version=version, config_contents=config_contents)
+                   version=version, **start_args)
 
     def reset_configuration(self, configuration):
-        """Ignore running state of the database server; just change
-           the config file to a new flavor.
+        """Reset the database base configuration.
+
+        Ignore running state of the database server, just change the config
+        file to a new flavor.
         """
         LOG.debug("Sending the call to change the database conf file on the "
                   "Guest with a timeout of %s.",
@@ -413,21 +447,15 @@ class API(object):
         """Stop the database server."""
         LOG.debug("Sending the call to stop the database process "
                   "on the Guest.")
-        version = self.API_BASE_VERSION
 
-        self._call("stop_db", self.agent_high_timeout,
-                   version=version,
-                   do_not_start_on_reboot=do_not_start_on_reboot)
+        version = '1.1'
+        stop_args = {}
+        if not self.client.can_send_version(version):
+            stop_args['do_not_start_on_reboot'] = do_not_start_on_reboot
+            version = '1.0'
 
-    def upgrade(self, instance_version, location, metadata=None):
-        """Make an asynchronous call to self upgrade the guest agent."""
-        LOG.debug("Sending an upgrade call to nova-guest.")
-        version = self.API_BASE_VERSION
-
-        self._cast("upgrade", version=version,
-                   instance_version=instance_version,
-                   location=location,
-                   metadata=metadata)
+        self._call("stop_db", self.agent_low_timeout,
+                   version=version, **stop_args)
 
     def get_volume_info(self):
         """Make a synchronous call to get volume info for the container."""
@@ -475,15 +503,22 @@ class API(object):
                    self.agent_low_timeout, version=version,
                    device_path=device_path, mount_point=mount_point)
 
-    def resize_fs(self, device_path=None, mount_point=None):
+    def resize_fs(self, device_path=None, mount_point=None, online=False):
         """Resize the filesystem."""
         LOG.debug("Resize device %(device)s on instance %(id)s.", {
             'device': device_path, 'id': self.id})
-        version = self.API_BASE_VERSION
+
+        resize_args = dict(device_path=device_path,
+                           mount_point=mount_point,
+                           online=online)
+
+        version = '1.1'
+        if not self.client.can_send_version(version):
+            resize_args.pop('online')
+            version = '1.0'
 
         self._call("resize_fs",
-                   self.agent_high_timeout, version=version,
-                   device_path=device_path, mount_point=mount_point)
+                   self.agent_high_timeout, version=version, **resize_args)
 
     def update_overrides(self, overrides, remove=False):
         """Update the overrides."""
@@ -542,13 +577,14 @@ class API(object):
         return self._call("get_replica_context",
                           self.agent_high_timeout, version=version)
 
-    def attach_replica(self, replica_info, slave_config):
+    def attach_replica(self, replica_info, slave_config, restart=False):
         LOG.debug("Attaching replica %s.", replica_info)
         version = self.API_BASE_VERSION
 
         self._call("attach_replica",
                    self.agent_high_timeout, version=version,
-                   replica_info=replica_info, slave_config=slave_config)
+                   replica_info=replica_info, slave_config=slave_config,
+                   restart=restart)
 
     def make_read_only(self, read_only):
         LOG.debug("Executing make_read_only(%s)", read_only)
@@ -628,6 +664,41 @@ class API(object):
                           enable=enable, disable=disable,
                           publish=publish, discard=discard)
 
+    def ssl_show(self):
+        LOG.debug("Showing SSL guest status for %s.", self.id)
+        version = '1.3'
+        if not self.client.can_send_version(version):
+            raise exception.GuestError(
+                original_message=("Operation requires guest version %s or "
+                                  "later" % version))
+
+        result = self._call("ssl_show", self.agent_high_timeout,
+                            version=version)
+        return result
+
+    def ssl_action(self, mode, container, enable, disable):
+        LOG.debug("Executing SSL action for %s.", self.id)
+        version = '1.3'
+        if not self.client.can_send_version(version):
+            raise exception.GuestError(
+                original_message=("Operation requires guest version %s or "
+                                  "later" % version))
+
+        return self._call("ssl_action", self.agent_high_timeout,
+                          version=version, mode=mode, container=container,
+                          enable=enable, disable=disable)
+
+    def ssl_rollback(self):
+        LOG.debug("Rolling back SSL configuration for %s.", self.id)
+        version = '1.3'
+        if not self.client.can_send_version(version):
+            raise exception.GuestError(
+                original_message=("Operation requires guest version %s or "
+                                  "later" % version))
+
+        return self._call("ssl_rollback", self.agent_high_timeout,
+                          version=version)
+
     def module_list(self, include_contents):
         LOG.debug("Querying modules on %s (contents: %s).",
                   self.id, include_contents)
@@ -651,3 +722,38 @@ class API(object):
 
         return self._call("module_remove", self.agent_high_timeout,
                           version=version, module=module)
+
+    def rebuild(self, ds_version, config_contents=None, config_overrides=None):
+        """Make an asynchronous call to rebuild the database service."""
+        LOG.debug("Sending the call to rebuild database service in the guest.")
+        version = self.API_BASE_VERSION
+
+        # Taskmanager is a publisher, guestagent is a consumer. Usually
+        # consumer creates a queue, but in this case we have to make sure
+        # "prepare" doesn't get lost if for some reason guest was delayed and
+        # didn't create a queue on time.
+        self._create_guest_queue()
+
+        self._cast("rebuild", version=version,
+                   ds_version=ds_version, config_contents=config_contents,
+                   config_overrides=config_overrides)
+
+    def pre_create_backup(self, **kwargs):
+        version = "1.2"
+        if not self.client.can_send_version(version):
+            raise exception.GuestError(
+                original_message="Operation requires guest version 1.2 or "
+                "later")
+
+        return self._call("pre_create_backup", self.agent_high_timeout,
+                          version=version, **kwargs)
+
+    def post_create_backup(self, **kwargs):
+        version = "1.2"
+        if not self.client.can_send_version(version):
+            raise exception.GuestError(
+                original_message="Operation requires guest version 1.2 or "
+                "later")
+
+        return self._call("post_create_backup", self.agent_high_timeout,
+                          version=version, **kwargs)

@@ -11,29 +11,34 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+import json
 import uuid
 
-from mock import Mock, patch
+from unittest.mock import Mock
+from unittest.mock import patch
+from unittest.mock import PropertyMock
 
 from trove.backup import models as backup_models
 from trove.common import cfg
+from trove.common import clients
+from trove.common import constants
 from trove.common import exception
-from trove.common.instance import ServiceStatuses
 from trove.common import neutron
 from trove.datastore import models as datastore_models
 from trove.instance import models
 from trove.instance.models import DBInstance
 from trove.instance.models import DBInstanceFault
-from trove.instance.models import filter_ips
+from trove.instance.models import DetailInstance
 from trove.instance.models import Instance
 from trove.instance.models import instance_encryption_key_cache
 from trove.instance.models import InstanceServiceStatus
+from trove.instance.models import InstanceStatus
 from trove.instance.models import SimpleInstance
+from trove.instance.service_status import ServiceStatuses
 from trove.instance.tasks import InstanceTasks
 from trove.taskmanager import api as task_api
 from trove.tests.fakes import nova
 from trove.tests.unittests import trove_testtools
-from trove.tests.unittests.util import util
 
 CONF = cfg.CONF
 
@@ -50,16 +55,22 @@ class SimpleInstanceTest(trove_testtools.TestCase):
                 ServiceStatuses.BUILDING), ds_version=Mock(), ds=Mock(),
             locality='affinity')
         self.instance.context = self.context
-        db_info.addresses = {"private": [{"addr": "123.123.123.123"}],
-                             "internal": [{"addr": "10.123.123.123"}],
-                             "public": [{"addr": "15.123.123.123"}]}
-        self.orig_conf = CONF.network_label_regex
+        db_info.addresses = [{
+            'type': 'private',
+            'address': '123.123.123.123',
+            'network': 'net-id-private'}, {
+            'type': 'private',
+            'address': '10.123.123.123',
+            'network': 'net-id-private'}, {
+            'type': 'public',
+            'address': '15.123.123.123',
+            'network': 'net-id-public'}]
+
         self.orig_ip_regex = CONF.ip_regex
         self.orig_black_list_regex = CONF.black_list_regex
 
     def tearDown(self):
         super(SimpleInstanceTest, self).tearDown()
-        CONF.network_label_regex = self.orig_conf
         CONF.ip_start = None
         CONF.management_networks = []
         CONF.ip_regex = self.orig_ip_regex
@@ -73,63 +84,19 @@ class SimpleInstanceTest(trove_testtools.TestCase):
         self.assertFalse(root_on_create_val)
 
     def test_filter_ips_white_list(self):
-        CONF.network_label_regex = '.*'
         CONF.ip_regex = '^(15.|123.)'
         CONF.black_list_regex = '^10.123.123.*'
         ip = self.instance.get_visible_ip_addresses()
-        ip = filter_ips(
-            ip, CONF.ip_regex, CONF.black_list_regex)
         self.assertEqual(2, len(ip))
-        self.assertIn('123.123.123.123', ip)
-        self.assertIn('15.123.123.123', ip)
+        self.assertIn('123.123.123.123', ip[0].get('address'))
+        self.assertIn('15.123.123.123', ip[1].get('address'))
 
     def test_filter_ips_black_list(self):
-        CONF.network_label_regex = '.*'
         CONF.ip_regex = '.*'
         CONF.black_list_regex = '^10.123.123.*'
         ip = self.instance.get_visible_ip_addresses()
-        ip = filter_ips(
-            ip, CONF.ip_regex, CONF.black_list_regex)
         self.assertEqual(2, len(ip))
         self.assertNotIn('10.123.123.123', ip)
-
-    def test_one_network_label(self):
-        CONF.network_label_regex = 'public'
-        ip = self.instance.get_visible_ip_addresses()
-        self.assertEqual(['15.123.123.123'], ip)
-
-    def test_two_network_labels(self):
-        CONF.network_label_regex = '^(private|public)$'
-        ip = self.instance.get_visible_ip_addresses()
-        self.assertEqual(2, len(ip))
-        self.assertIn('123.123.123.123', ip)
-        self.assertIn('15.123.123.123', ip)
-
-    def test_all_network_labels(self):
-        CONF.network_label_regex = '.*'
-        ip = self.instance.get_visible_ip_addresses()
-        self.assertEqual(3, len(ip))
-        self.assertIn('10.123.123.123', ip)
-        self.assertIn('123.123.123.123', ip)
-        self.assertIn('15.123.123.123', ip)
-
-    @patch('trove.common.clients.create_neutron_client')
-    def test_filter_management_ip_addresses(self, mock_neutron_client):
-        CONF.network_label_regex = ''
-        CONF.management_networks = ['fake-net-id']
-
-        neutron_client = Mock()
-        neutron_client.show_network.return_value = {
-            'network': {'name': 'public'}
-        }
-        mock_neutron_client.return_value = neutron_client
-
-        ip = self.instance.get_visible_ip_addresses()
-
-        neutron_client.show_network.assert_called_once_with('fake-net-id')
-        self.assertEqual(2, len(ip))
-        self.assertIn('123.123.123.123', ip)
-        self.assertIn('10.123.123.123', ip)
 
     def test_locality(self):
         self.assertEqual('affinity', self.instance.locality)
@@ -150,11 +117,95 @@ class SimpleInstanceTest(trove_testtools.TestCase):
             self.assertEqual(fault_date, fault.updated)
 
 
+class BaseInstanceTest(trove_testtools.TestCase):
+
+    def setUp(self):
+        super(BaseInstanceTest, self).setUp()
+        db_info = Mock(
+            id='instance-id', tenant_id='tenant-id',
+            datastore_version_id=None)
+        self.instance = models.BaseInstance(None, db_info, Mock(), None)
+        self.instance.db_info.addresses = [
+            {
+                'address': '192.0.2.10',
+                'type': 'private',
+                'network': 'user-network',
+            },
+            {
+                'address': '198.51.100.10',
+                'type': 'public',
+            },
+        ]
+        self.instance._neutron_client = Mock()
+
+        CONF.set_override('management_networks', ['management-network'])
+        CONF.set_override('network_isolation', True, group='network')
+        self.addCleanup(CONF.clear_override, 'management_networks')
+        self.addCleanup(
+            CONF.clear_override, 'network_isolation', group='network')
+
+    @patch.object(models, 'get_instance_encryption_key', return_value=None)
+    @patch.object(models.BaseInstance, 'datastore_repl_strategy',
+                  new_callable=PropertyMock, return_value='repl-strategy')
+    @patch.object(models.BaseInstance, 'datastore_registry_ext',
+                  new_callable=PropertyMock, return_value='registry-ext')
+    def test_get_injected_files_with_network_isolation(
+            self, mock_registry_ext, mock_repl_strategy,
+            mock_get_encryption_key):
+        self.instance.neutron_client.list_ports.return_value = {
+            'ports': [
+                {'id': 'user-port', 'network_id': 'user-network'},
+            ]
+        }
+        self.instance.neutron_client.show_port.return_value = {
+            'port': {
+                'mac_address': '00:00:00:00:00:01',
+                'fixed_ips': [{
+                    'subnet_id': 'user-subnet',
+                    'ip_address': '192.0.2.10',
+                }],
+            }
+        }
+        self.instance.neutron_client.show_subnet.return_value = {
+            'subnet': {
+                'ip_version': 4,
+                'cidr': '192.0.2.0/24',
+                'gateway_ip': '192.0.2.1',
+                'host_routes': [],
+            }
+        }
+
+        files = self.instance.get_injected_files('mysql', '8.0')
+
+        self.assertEqual(
+            {
+                'mac_address': '00:00:00:00:00:01',
+                'ipv4_address': '192.0.2.10',
+                'ipv4_cidr': '192.0.2.0/24',
+                'ipv4_gateway': '192.0.2.1',
+                'ipv4_host_routes': [],
+            },
+            json.loads(files[constants.ETH1_CONFIG_PATH])
+        )
+        self.assertEqual(
+            {
+                'bridge': 'none',
+                'ip-forward': False,
+                'iptables': False,
+            },
+            json.loads(files['/etc/docker/daemon.json'])
+        )
+        self.instance.neutron_client.list_ports.assert_called_once_with(
+            name='trove-instance-id',
+            network_id='user-network')
+        self.instance.neutron_client.show_port.assert_called_once_with(
+            'user-port')
+
+
 class CreateInstanceTest(trove_testtools.TestCase):
 
     @patch.object(task_api.API, 'get_client', Mock(return_value=Mock()))
     def setUp(self):
-        util.init_db()
         self.context = trove_testtools.TroveTestContext(self, is_admin=True)
         self.name = "name"
         self.flavor_id = 5
@@ -173,6 +224,8 @@ class CreateInstanceTest(trove_testtools.TestCase):
                 manager="mysql",
                 image_id="image_id",
                 packages="",
+                registry_ext="registry_ext",
+                repl_strategy="repl_strategy",
                 active=True))
         self.volume_size = 1
         self.az = "az"
@@ -208,8 +261,10 @@ class CreateInstanceTest(trove_testtools.TestCase):
             deleted=False
         )
         self.backup_id = self.backup.id
-        self.orig_client = models.create_nova_client
-        models.create_nova_client = nova.fake_create_nova_client
+
+        self.orig_client = clients.create_nova_client
+        clients.create_nova_client = nova.fake_create_nova_client
+
         self.orig_api = task_api.API(self.context).create_instance
         task_api.API(self.context).create_instance = Mock()
         self.run_with_quotas = models.run_with_quotas
@@ -232,7 +287,7 @@ class CreateInstanceTest(trove_testtools.TestCase):
         self.backup.delete()
         self.datastore.delete()
         self.datastore_version.delete()
-        models.create_nova_client = self.orig_client
+        clients.create_nova_client = self.orig_client
         task_api.API(self.context).create_instance = self.orig_api
         models.run_with_quotas = self.run_with_quotas
         backup_models.DBBackup.check_swift_object_exist = self.check
@@ -285,7 +340,6 @@ class TestInstanceUpgrade(trove_testtools.TestCase):
 
     def setUp(self):
         self.context = trove_testtools.TroveTestContext(self, is_admin=True)
-        util.init_db()
 
         self.datastore = datastore_models.DBDatastore.create(
             id=str(uuid.uuid4()),
@@ -299,6 +353,8 @@ class TestInstanceUpgrade(trove_testtools.TestCase):
             packages=str(uuid.uuid4()),
             datastore_id=self.datastore.id,
             manager='test',
+            registry_ext="registry_ext",
+            repl_strategy="repl_strategy",
             active=1)
 
         self.datastore_version2 = datastore_models.DBDatastoreVersion.create(
@@ -308,23 +364,26 @@ class TestInstanceUpgrade(trove_testtools.TestCase):
             packages=str(uuid.uuid4()),
             datastore_id=self.datastore.id,
             manager='test',
+            registry_ext="registry_ext",
+            repl_strategy="repl_strategy",
             active=1)
 
-        self.safe_nova_client = models.create_nova_client
-        models.create_nova_client = nova.fake_create_nova_client
+        self.safe_nova_client = clients.create_nova_client
+        clients.create_nova_client = nova.fake_create_nova_client
         super(TestInstanceUpgrade, self).setUp()
 
     def tearDown(self):
         self.datastore.delete()
         self.datastore_version1.delete()
         self.datastore_version2.delete()
-        models.create_nova_client = self.safe_nova_client
+        clients.create_nova_client = self.safe_nova_client
         super(TestInstanceUpgrade, self).tearDown()
 
+    @patch('trove.common.clients.create_neutron_client')
     @patch.object(task_api.API, 'get_client', Mock(return_value=Mock()))
     @patch.object(task_api.API, 'upgrade')
     @patch('trove.tests.fakes.nova.LOG')
-    def test_upgrade(self, mock_logging, task_upgrade):
+    def test_upgrade(self, mock_logging, task_upgrade, mock_neutron_client):
         instance_model = DBInstance(
             InstanceTasks.NONE,
             id=str(uuid.uuid4()),
@@ -357,7 +416,6 @@ class TestInstanceUpgrade(trove_testtools.TestCase):
 class TestReplication(trove_testtools.TestCase):
 
     def setUp(self):
-        util.init_db()
 
         self.datastore = datastore_models.DBDatastore.create(
             id=str(uuid.uuid4()),
@@ -371,6 +429,8 @@ class TestReplication(trove_testtools.TestCase):
             packages=str(uuid.uuid4()),
             datastore_id=self.datastore.id,
             manager='mysql',
+            registry_ext="registry_ext",
+            repl_strategy="repl_strategy",
             active=1)
 
         self.databases = []
@@ -382,6 +442,7 @@ class TestReplication(trove_testtools.TestCase):
             id=str(uuid.uuid4()),
             name="TestMasterInstance",
             datastore_version_id=self.datastore_version.id,
+            flavor_id=str(uuid.uuid4()),
             volume_size=2)
         self.master.set_task_status(InstanceTasks.NONE)
         self.master.save()
@@ -391,8 +452,8 @@ class TestReplication(trove_testtools.TestCase):
             instance_id=self.master.id)
         self.master_status.save()
 
-        self.safe_nova_client = models.create_nova_client
-        models.create_nova_client = nova.fake_create_nova_client
+        self.safe_nova_client = clients.create_nova_client
+        clients.create_nova_client = nova.fake_create_nova_client
 
         self.swift_verify_patch = patch.object(models.Backup,
                                                'verify_swift_auth_token')
@@ -406,20 +467,8 @@ class TestReplication(trove_testtools.TestCase):
         self.master_status.delete()
         self.datastore.delete()
         self.datastore_version.delete()
-        models.create_nova_client = self.safe_nova_client
+        clients.create_nova_client = self.safe_nova_client
         super(TestReplication, self).tearDown()
-
-    @patch('trove.instance.models.LOG')
-    def test_replica_of_not_active_master(self, mock_logging):
-        self.master.set_task_status(InstanceTasks.BUILDING)
-        self.master.save()
-        self.master_status.set_status(ServiceStatuses.BUILDING)
-        self.master_status.save()
-        self.assertRaises(exception.UnprocessableEntity,
-                          Instance.create,
-                          None, 'name', 1, "UUID", [], [], self.datastore,
-                          self.datastore_version, 2,
-                          None, slave_of_id=self.master.id)
 
     @patch('trove.instance.models.LOG')
     def test_replica_with_invalid_slave_of_id(self, mock_logging):
@@ -428,45 +477,6 @@ class TestReplication(trove_testtools.TestCase):
                           None, 'name', 1, "UUID", [], [], self.datastore,
                           self.datastore_version, 2,
                           None, slave_of_id=str(uuid.uuid4()))
-
-    def test_create_replica_from_replica(self):
-        self.replica_datastore_version = Mock(
-            spec=datastore_models.DBDatastoreVersion)
-        self.replica_datastore_version.id = "UUID"
-        self.replica_datastore_version.manager = 'mysql'
-        self.replica_info = DBInstance(
-            InstanceTasks.NONE,
-            id="UUID",
-            name="TestInstance",
-            datastore_version_id=self.replica_datastore_version.id,
-            slave_of_id=self.master.id)
-        self.replica_info.save()
-        self.assertRaises(exception.Forbidden, Instance.create,
-                          None, 'name', 2, "UUID", [], [], self.datastore,
-                          self.datastore_version, 2,
-                          None, slave_of_id=self.replica_info.id)
-
-    def test_create_replica_with_users(self):
-        self.users.append({"name": "testuser", "password": "123456"})
-        self.assertRaises(exception.ReplicaCreateWithUsersDatabasesError,
-                          Instance.create, None, 'name', 2, "UUID", [],
-                          self.users, self.datastore, self.datastore_version,
-                          1, None, slave_of_id=self.master.id)
-
-    def test_create_replica_with_databases(self):
-        self.databases.append({"name": "testdb"})
-        self.assertRaises(exception.ReplicaCreateWithUsersDatabasesError,
-                          Instance.create, None, 'name', 1, "UUID",
-                          self.databases, [], self.datastore,
-                          self.datastore_version, 2, None,
-                          slave_of_id=self.master.id)
-
-    def test_replica_volume_size_smaller_than_master(self):
-        self.assertRaises(exception.Forbidden,
-                          Instance.create,
-                          None, 'name', 1, "UUID", [], [], self.datastore,
-                          self.datastore_version, 1,
-                          None, slave_of_id=self.master.id)
 
 
 def trivial_key_function(id):
@@ -517,3 +527,89 @@ class TestInstanceKeyCaching(trove_testtools.TestCase):
         self.assertEqual(keyfn.call_count, 1)
         self.assertIsNone(keycache[30])
         self.assertEqual(keyfn.call_count, 2)
+
+
+class TestDetailInstance(trove_testtools.TestCase):
+    def setUp(self):
+        super(TestDetailInstance, self).setUp()
+        self.context = trove_testtools.TroveTestContext(self)
+        db_info = DBInstance(
+            InstanceTasks.NONE, name="TestInstance")
+        db_info.id = '1'
+        db_info.datastore_version_id = None
+        db_info.server_status = 'ACTIVE'
+        self.instance = DetailInstance(
+            self.context, db_info, InstanceServiceStatus(
+                ServiceStatuses.HEALTHY))
+        self.instance.context = self.context
+
+        self.backup_running_patcher = patch.object(
+            backup_models.Backup,
+            'running',
+            Mock(return_value=False)
+        )
+        self.backup_running_patcher.start()
+        self.addCleanup(self.backup_running_patcher.stop)
+
+        self.guest_client_patcher = patch(
+            'trove.common.clients.create_guest_client'
+        )
+        self.guest_client_mock = self.guest_client_patcher.start()
+        self.addCleanup(self.guest_client_patcher.stop)
+
+    def tearDown(self):
+        super(TestDetailInstance, self).tearDown()
+
+    def test_load_guest_info_used_percent(self):
+        client = Mock()
+        client.get_volume_info.return_value = {
+            'total_blocks': 249195, 'free_blocks': 229099,
+            'avail_blocks': 211896, 'total': 0.95, 'used': 0.08
+        }
+        self.guest_client_mock.return_value = client
+
+        instance = models.load_guest_info(self.instance, self.context, None)
+        self.assertEqual(instance.volume_used_percent, 8.66)
+
+    def test_load_guest_info_mgr_extra_info(self):
+        client = Mock()
+        client.get_volume_info.return_value = {
+            'used': 0.01,
+            'total': 1,
+            'mgr_extra_info': {'test': 'value'}
+        }
+        self.guest_client_mock.return_value = client
+
+        instance = models.load_guest_info(self.instance, self.context, None)
+        self.assertEqual(instance.mgr_extra_info['test'], 'value')
+
+    def test_load_guest_info_backwards_compat(self):
+        client = Mock()
+        client.get_volume_info.return_value = {
+            'block_size': 4096, 'total_blocks': 249195, 'free_blocks': 229099,
+            'total': 0.95, 'free': 938389504, 'used': 0.08
+        }
+        self.guest_client_mock.return_value = client
+
+        instance = models.load_guest_info(self.instance, self.context, None)
+        self.assertEqual(instance.volume_used, 0.08)
+        self.assertEqual(instance.volume_total, 0.95)
+        self.assertIsNone(instance.volume_used_percent)
+        self.assertIsNone(instance.mgr_extra_info, None)
+
+    def test_load_guest_info_skipped_while_deleting(self):
+        db_info = DBInstance(InstanceTasks.DELETING, name="TestInstance")
+        db_info.id = '1'
+        db_info.datastore_version_id = None
+        db_info.server_status = 'ACTIVE'
+        instance = DetailInstance(
+            self.context, db_info,
+            InstanceServiceStatus(ServiceStatuses.HEALTHY))
+        instance.context = self.context
+        self.assertEqual(InstanceStatus.SHUTDOWN, instance.status)
+
+        instance = models.load_guest_info(instance, self.context, None)
+
+        self.guest_client_mock.assert_not_called()
+        self.assertIsNone(instance.volume_used)
+        self.assertIsNone(instance.volume_total)

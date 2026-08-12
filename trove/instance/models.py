@@ -15,30 +15,30 @@
 #    under the License.
 
 """Model classes that form the core of instances functionality."""
-from datetime import datetime
-from datetime import timedelta
+import base64
+import json
 import os.path
 import re
-import six
+import yaml
 
+from datetime import datetime
+from datetime import timedelta
+
+from novaclient import api_versions
 from novaclient import exceptions as nova_exceptions
 from oslo_config.cfg import NoSuchOptError
 from oslo_log import log as logging
 from oslo_utils import encodeutils
+from oslo_utils import netutils
 from sqlalchemy import func
 
 from trove.backup.models import Backup
 from trove.common import cfg
-from trove.common.clients import create_cinder_client
-from trove.common.clients import create_dns_client
-from trove.common.clients import create_glance_client
-from trove.common.clients import create_guest_client
-from trove.common.clients import create_neutron_client
-from trove.common.clients import create_nova_client
+from trove.common import clients
+from trove.common import constants
 from trove.common import crypto_utils as cu
 from trove.common import exception
 from trove.common.i18n import _
-from trove.common import instance as tr_instance
 from trove.common import neutron
 from trove.common import notification
 from trove.common import server_group as srv_grp
@@ -53,6 +53,7 @@ from trove.datastore.models import DBDatastoreVersionMetadata
 from trove.db import get_db_api
 from trove.db import models as dbmodels
 from trove.extensions.security_group.models import SecurityGroup
+from trove.instance import service_status as srvstatus
 from trove.instance.tasks import InstanceTask
 from trove.instance.tasks import InstanceTasks
 from trove.module import models as module_models
@@ -63,13 +64,18 @@ from trove.taskmanager import api as task_api
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
+# Invalid states to contact the agent
+AGENT_INVALID_STATUSES = ["BUILD", "REBOOT", "RESIZE", "PROMOTE", "EJECT",
+                          "UPGRADE", "SHUTDOWN"]
 
-def filter_ips(ips, white_list_regex, black_list_regex):
-    """Return IPs matching white_list_regex and
-       Filter out IPs matching black_list_regex.
-    """
-    return [ip for ip in ips if re.search(white_list_regex, ip)
-            and not re.search(black_list_regex, ip)]
+CLOUDINIT_HEADER = "#cloud-config\n"
+
+
+def ip_visible(ip, white_list_regex, black_list_regex):
+    if re.search(white_list_regex, ip) and not re.search(black_list_regex, ip):
+        return True
+
+    return False
 
 
 def load_server(context, instance_id, server_id, region_name):
@@ -84,7 +90,7 @@ def load_server(context, instance_id, server_id, region_name):
     :type server_id: unicode
     :rtype: novaclient.v2.servers.Server
     """
-    client = create_nova_client(context, region_name=region_name)
+    client = clients.create_nova_client(context, region_name=region_name)
     try:
         server = client.servers.get(server_id)
     except nova_exceptions.NotFound:
@@ -129,21 +135,51 @@ def load_simple_instance_server_status(context, db_info):
     """Loads a server or raises an exception."""
     if 'BUILDING' == db_info.task_status.action:
         db_info.server_status = "BUILD"
-        db_info.addresses = {}
     else:
-        client = create_nova_client(context, db_info.region_id)
+        client = clients.create_nova_client(context, db_info.region_id)
         try:
             server = client.servers.get(db_info.compute_instance_id)
             db_info.server_status = server.status
-            db_info.addresses = server.addresses
         except nova_exceptions.NotFound:
             db_info.server_status = "SHUTDOWN"
-            db_info.addresses = {}
 
 
-# Invalid states to contact the agent
-AGENT_INVALID_STATUSES = ["BUILD", "REBOOT", "RESIZE", "PROMOTE", "EJECT",
-                          "UPGRADE"]
+def load_simple_instance_addresses(context, db_info):
+    """Get addresses of the instance from Neutron."""
+    addresses = []
+    user_ports = []
+    try:
+        client = clients.create_neutron_client(context, db_info.region_id)
+        ports = neutron.get_instance_ports(client, db_info.compute_instance_id)
+    except nova_exceptions.NotFound:
+        db_info.addresses = []
+        return
+    for port in ports:
+        if port['network_id'] not in CONF.management_networks:
+            LOG.debug('Found user port %s for instance %s', port['id'],
+                      db_info.id)
+
+            user_ports.append(port['id'])
+            for ip in port['fixed_ips']:
+                # TODO(lxkong): IPv6 is not supported
+                if netutils.is_valid_ipv4(ip.get('ip_address')):
+                    addresses.append(
+                        {
+                            'address': ip['ip_address'],
+                            'type': 'private',
+                            'network': port['network_id']
+                        }
+                    )
+
+            fips = neutron.get_port_fips(client, port['id'])
+            if len(fips) == 0:
+                continue
+            fip = fips[0]
+            addresses.append(
+                {'address': fip['floating_ip_address'], 'type': 'public'})
+
+    db_info.ports = user_ports
+    db_info.addresses = addresses
 
 
 class SimpleInstance(object):
@@ -179,30 +215,32 @@ class SimpleInstance(object):
         self.root_pass = root_password
         self._fault = None
         self._fault_loaded = False
-        if ds_version is None:
+        self.ds_version = None
+        self.ds = None
+        self.locality = locality
+        self.slave_list = None
+
+        if ds_version is None and self.db_info.datastore_version_id:
             self.ds_version = (datastore_models.DatastoreVersion.
                                load_by_uuid(self.db_info.datastore_version_id))
-        if ds is None:
+        if ds is None and self.ds_version:
             self.ds = (datastore_models.Datastore.
                        load(self.ds_version.datastore_id))
-        self.locality = locality
-
-        self.slave_list = None
 
     def __repr__(self, *args, **kwargs):
         return "%s(%s)" % (self.name, self.id)
 
     @property
     def addresses(self):
-        # TODO(tim.simpson): This code attaches two parts of the Nova server to
-        #                   db_info: "status" and "addresses". The idea
-        #                   originally was to listen to events to update this
-        #                   data and store it in the Trove database.
-        #                   However, it may have been unwise as a year and a
-        #                   half later we still have to load the server anyway
-        #                   and this makes the code confusing.
         if hasattr(self.db_info, 'addresses'):
             return self.db_info.addresses
+        else:
+            return None
+
+    @property
+    def ports(self):
+        if hasattr(self.db_info, 'ports'):
+            return self.db_info.ports
         else:
             return None
 
@@ -215,7 +253,8 @@ class SimpleInstance(object):
         """Returns the IP address to be used with DNS."""
         ips = self.get_visible_ip_addresses()
         if ips:
-            return ips[0]
+            # FIXME
+            return ips[0]['address']
 
     @property
     def flavor_id(self):
@@ -228,24 +267,17 @@ class SimpleInstance(object):
 
     def get_visible_ip_addresses(self):
         """Returns IPs that will be visible to the user."""
-        if self.addresses is None:
+        if not self.addresses:
             return None
 
         IPs = []
-        mgmt_networks = neutron.get_management_networks(self.context)
+        for address in self.addresses:
+            if CONF.ip_regex and CONF.black_list_regex:
+                if not ip_visible(address['address'], CONF.ip_regex,
+                                  CONF.black_list_regex):
+                    continue
 
-        for label in self.addresses:
-            if label in mgmt_networks:
-                continue
-            if (CONF.network_label_regex and
-                    not re.search(CONF.network_label_regex, label)):
-                continue
-
-            IPs.extend([addr.get('addr') for addr in self.addresses[label]])
-
-        # Includes ip addresses that match the regexp pattern
-        if CONF.ip_regex and CONF.black_list_regex:
-            IPs = filter_ips(IPs, CONF.ip_regex, CONF.black_list_regex)
+            IPs.append(address)
 
         return IPs
 
@@ -310,33 +342,51 @@ class SimpleInstance(object):
         self.__datastore_status = datastore_status
 
     @property
+    def operating_status(self):
+        """operating_status is the database service status."""
+        task_status = self.db_info.task_status
+        server_status = self.db_info.server_status
+        ds_status = self.datastore_status.status
+
+        if (task_status != InstanceTasks.NONE or server_status != 'ACTIVE'):
+            return ""
+
+        return repr(ds_status)
+
+    @property
     def status(self):
+        """The server status of the database instance.
+
+        - The task action is considered first.
+        - If it's performing backup or not.
+        - Then server status
+        - Otherwise, unknown
+        """
+        LOG.debug(f"Getting instance status for {self.id}, "
+                  f"task status: {self.db_info.task_status}, "
+                  f"datastore status: {self.datastore_status.status}, "
+                  f"server status: {self.db_info.server_status}")
+
+        task_status = self.db_info.task_status
+        server_status = self.db_info.server_status
+
         # Check for taskmanager errors.
-        if self.db_info.task_status.is_error:
+        if task_status.is_error:
             return InstanceStatus.ERROR
 
-        action = self.db_info.task_status.action
-
-        # Check if we are resetting status or force deleting
-        if (tr_instance.ServiceStatuses.UNKNOWN == self.datastore_status.status
-                and action == InstanceTasks.DELETING.action):
-            return InstanceStatus.SHUTDOWN
-        elif (tr_instance.ServiceStatuses.UNKNOWN ==
-                self.datastore_status.status):
-            return InstanceStatus.ERROR
-
+        action = task_status.action
         # Check for taskmanager status.
-        if 'BUILDING' == action:
-            if 'ERROR' == self.db_info.server_status:
+        if InstanceTasks.BUILDING.action == action:
+            if 'ERROR' == server_status:
                 return InstanceStatus.ERROR
             return InstanceStatus.BUILD
-        if 'REBOOTING' == action:
+        if InstanceTasks.REBOOTING.action == action:
             return InstanceStatus.REBOOT
-        if 'RESIZING' == action:
+        if InstanceTasks.RESIZING.action == action:
             return InstanceStatus.RESIZE
-        if 'UPGRADING' == action:
+        if InstanceTasks.UPGRADING.action == action:
             return InstanceStatus.UPGRADE
-        if 'RESTART_REQUIRED' == action:
+        if InstanceTasks.RESTART_REQUIRED.action == action:
             return InstanceStatus.RESTART_REQUIRED
         if InstanceTasks.PROMOTING.action == action:
             return InstanceStatus.PROMOTE
@@ -346,43 +396,31 @@ class SimpleInstance(object):
             return InstanceStatus.LOGGING
         if InstanceTasks.DETACHING.action == action:
             return InstanceStatus.DETACH
-
-        # Check for server status.
-        if self.db_info.server_status in ["BUILD", "ERROR", "REBOOT",
-                                          "RESIZE"]:
-            return self.db_info.server_status
-
-        # As far as Trove is concerned, Nova instances in VERIFY_RESIZE should
-        # still appear as though they are in RESIZE.
-        if self.db_info.server_status in ["VERIFY_RESIZE"]:
-            return InstanceStatus.RESIZE
+        # Report as Shutdown while deleting, unless there's an error.
+        if InstanceTasks.DELETING.action == action:
+            if server_status in ["ACTIVE", "SHUTDOWN", "DELETED"]:
+                return InstanceStatus.SHUTDOWN
+            else:
+                LOG.error("While shutting down instance (%(instance)s): "
+                          "server had status (%(status)s).",
+                          {'instance': self.id, 'status': server_status})
+                return InstanceStatus.ERROR
 
         # Check if there is a backup running for this instance
         if Backup.running(self.id):
             return InstanceStatus.BACKUP
 
-        # Report as Shutdown while deleting, unless there's an error.
-        if 'DELETING' == action:
-            if self.db_info.server_status in ["ACTIVE", "SHUTDOWN", "DELETED",
-                                              "HEALTHY"]:
-                return InstanceStatus.SHUTDOWN
-            else:
-                LOG.error("While shutting down instance (%(instance)s): "
-                          "server had status (%(status)s).",
-                          {'instance': self.id,
-                           'status': self.db_info.server_status})
-                return InstanceStatus.ERROR
+        # Check for server status.
+        if server_status in ["BUILD", "ERROR", "REBOOT", "RESIZE", "ACTIVE",
+                             "SHUTDOWN"]:
+            return server_status
 
-        # Check against the service status.
-        # The service is only paused during a reboot.
-        if tr_instance.ServiceStatuses.PAUSED == self.datastore_status.status:
-            return InstanceStatus.REBOOT
-        # If the service status is NEW, then we are building.
-        if tr_instance.ServiceStatuses.NEW == self.datastore_status.status:
-            return InstanceStatus.BUILD
+        # As far as Trove is concerned, Nova instances in VERIFY_RESIZE should
+        # still appear as though they are in RESIZE.
+        if server_status in ["VERIFY_RESIZE"]:
+            return InstanceStatus.RESIZE
 
-        # For everything else we can look at the service status mapping.
-        return self.datastore_status.status.api_status
+        return "UNKNOWN"
 
     @property
     def updated(self):
@@ -410,11 +448,15 @@ class SimpleInstance(object):
 
     @property
     def volume_support(self):
-        return CONF.get(self.datastore_version.manager).volume_support
+        if self.datastore_version:
+            return CONF.get(self.datastore_version.manager).volume_support
+        return None
 
     @property
     def device_path(self):
-        return CONF.get(self.datastore_version.manager).device_path
+        if self.datastore_version:
+            return CONF.get(self.datastore_version.manager).device_path
+        return None
 
     @property
     def root_password(self):
@@ -464,6 +506,15 @@ class SimpleInstance(object):
     def encrypted_rpc_messaging(self):
         return True if self.db_info.encrypted_key is not None else False
 
+    @property
+    def access(self):
+        if hasattr(self.db_info, 'access'):
+            if isinstance(self.db_info.access, str):
+                return json.loads(self.db_info.access)
+            return self.db_info.access
+        else:
+            return None
+
 
 class DetailInstance(SimpleInstance):
     """A detailed view of an Instance.
@@ -477,6 +528,8 @@ class DetailInstance(SimpleInstance):
                                              datastore_status)
         self._volume_used = None
         self._volume_total = None
+        self._volume_used_percent = None
+        self._mgr_extra_info = None
 
     @property
     def volume_used(self):
@@ -493,6 +546,22 @@ class DetailInstance(SimpleInstance):
     @volume_total.setter
     def volume_total(self, value):
         self._volume_total = value
+
+    @property
+    def volume_used_percent(self):
+        return self._volume_used_percent
+
+    @volume_used_percent.setter
+    def volume_used_percent(self, value):
+        self._volume_used_percent = value
+
+    @property
+    def mgr_extra_info(self):
+        return self._mgr_extra_info
+
+    @mgr_extra_info.setter
+    def mgr_extra_info(self, value):
+        self._mgr_extra_info = value
 
 
 def get_db_info(context, id, cluster_id=None, include_deleted=False):
@@ -544,15 +613,16 @@ def load_instance(cls, context, id, needs_server=False,
         # necessary and instead we'll just use the server_status field from
         # the instance table.
         load_simple_instance_server_status(context, db_info)
+        load_simple_instance_addresses(context, db_info)
         server = None
     else:
         try:
             server = load_server(context, db_info.id,
                                  db_info.compute_instance_id,
                                  region_name=db_info.region_id)
-            # TODO(tim.simpson): Remove this hack when we have notifications!
             db_info.server_status = server.status
-            db_info.addresses = server.addresses
+
+            load_simple_instance_addresses(context, db_info)
         except exception.ComputeInstanceNotFound:
             LOG.error("Could not load compute instance %s.",
                       db_info.compute_instance_id)
@@ -562,28 +632,57 @@ def load_instance(cls, context, id, needs_server=False,
     service_status = InstanceServiceStatus.find_by(instance_id=id)
     LOG.debug("Instance %(instance_id)s service status is %(service_status)s.",
               {'instance_id': id, 'service_status': service_status.status})
+
     return cls(context, db_info, server, service_status)
 
 
-def load_instance_with_info(cls, context, id, cluster_id=None):
-    db_info = get_db_info(context, id, cluster_id)
+def update_service_status(task_status, service_status, ins_id):
+    """Update service status as needed."""
+    RESTART_REQUIRED = srvstatus.ServiceStatuses.RESTART_REQUIRED
+    if (task_status == InstanceTasks.NONE and
+            service_status.status != RESTART_REQUIRED and
+            not service_status.is_uptodate()):
+        LOG.warning('Guest agent heartbeat for instance %s has expried',
+                    ins_id)
+        service_status.status = \
+            srvstatus.ServiceStatuses.FAILED_TIMEOUT_GUESTAGENT
+
+
+def load_instance_with_info(cls, context, ins_id, cluster_id=None):
+    db_info = get_db_info(context, ins_id, cluster_id)
+    service_status = InstanceServiceStatus.find_by(instance_id=ins_id)
+
+    update_service_status(db_info.task_status, service_status, ins_id)
+
     load_simple_instance_server_status(context, db_info)
-    service_status = InstanceServiceStatus.find_by(instance_id=id)
-    LOG.debug("Instance %(instance_id)s service status is %(service_status)s.",
-              {'instance_id': id, 'service_status': service_status.status})
+
+    load_simple_instance_addresses(context, db_info)
+
     instance = cls(context, db_info, service_status)
-    load_guest_info(instance, context, id)
+
+    load_guest_info(instance, context, ins_id)
+
     load_server_group_info(instance, context)
+
     return instance
 
 
 def load_guest_info(instance, context, id):
     if instance.status not in AGENT_INVALID_STATUSES:
-        guest = create_guest_client(context, id)
+        guest = clients.create_guest_client(context, id)
         try:
             volume_info = guest.get_volume_info()
             instance.volume_used = volume_info['used']
             instance.volume_total = volume_info['total']
+            required_keys = {'avail_blocks', 'free_blocks', 'total_blocks'}
+            if all(key in volume_info for key in required_keys):
+                tb = volume_info['total_blocks']
+                fb = volume_info['free_blocks']
+                ab = volume_info['avail_blocks']
+                used_percent = round(100 * (tb - fb) / (tb - fb + ab), 2)
+                instance.volume_used_percent = used_percent
+            if 'mgr_extra_info' in volume_info:
+                instance.mgr_extra_info = volume_info['mgr_extra_info']
         except Exception as e:
             LOG.exception(e)
     return instance
@@ -640,7 +739,7 @@ class BaseInstance(SimpleInstance):
         self._server_group_loaded = False
 
     def get_guest(self):
-        return create_guest_client(self.context, self.db_info.id)
+        return clients.create_guest_client(self.context, self.db_info.id)
 
     def delete(self):
         def _delete_resources():
@@ -653,7 +752,8 @@ class BaseInstance(SimpleInstance):
 
             from trove.cluster.models import is_cluster_deleting
             if (self.db_info.cluster_id is not None and not
-               is_cluster_deleting(self.context, self.db_info.cluster_id)):
+                    is_cluster_deleting(context=self.context,
+                                        cluster_id=self.db_info.cluster_id)):
                 raise exception.ClusterInstanceOperationNotSupported()
 
             if self.slaves:
@@ -664,8 +764,8 @@ class BaseInstance(SimpleInstance):
             self.update_db(task_status=InstanceTasks.DELETING,
                            configuration_id=None)
             task_api.API(self.context).delete_instance(self.id)
-
-        deltas = {'instances': -1}
+        flavor = self.get_flavor()
+        deltas = {'instances': -1, 'ram': -flavor.ram}
         if self.volume_support:
             deltas['volumes'] = -self.volume_size
         return run_with_quotas(self.tenant_id,
@@ -708,7 +808,7 @@ class BaseInstance(SimpleInstance):
             except Exception as e:
                 LOG.warning("Failed to stop the database before attempting "
                             "to delete trove instance %s, error: %s", self.id,
-                            six.text_type(e))
+                            str(e))
 
             # Nova VM
             if old_server:
@@ -717,7 +817,7 @@ class BaseInstance(SimpleInstance):
                     self.server.delete()
                 except Exception as e:
                     LOG.warning("Failed to delete compute server %s",
-                                self.server_id, six.text_type(e))
+                                self.server_id, str(e))
 
         # Neutron ports (floating IP)
         try:
@@ -729,7 +829,7 @@ class BaseInstance(SimpleInstance):
                 neutron.delete_port(self.neutron_client, port["id"])
         except Exception as e:
             LOG.warning("Failed to delete ports for instance %s, "
-                        "error: %s", self.id, six.text_type(e))
+                        "error: %s", self.id, str(e))
 
         # Neutron security groups
         try:
@@ -742,34 +842,30 @@ class BaseInstance(SimpleInstance):
                 self.neutron_client.delete_security_group(sg["id"])
         except Exception as e:
             LOG.warning("Failed to delete security groups for instance %s, "
-                        "error: %s", self.id, six.text_type(e))
+                        "error: %s", self.id, str(e))
 
         # DNS resources, e.g. Designate
         try:
             dns_support = CONF.trove_dns_support
             if dns_support:
-                dns_api = create_dns_client(self.context)
+                dns_api = clients.create_dns_client(self.context)
                 dns_api.delete_instance_entry(instance_id=self.id)
         except Exception as e:
             LOG.warning("Failed to delete dns entry of instance %s, error: %s",
-                        self.id, six.text_type(e))
+                        self.id, str(e))
 
         # Nova server group
         try:
             srv_grp.ServerGroup.delete(self.context, self.server_group)
         except Exception as e:
             LOG.warning("Failed to delete server group for %s, error: %s",
-                        self.id, six.text_type(e))
+                        self.id, str(e))
 
         def server_is_finished():
             try:
                 server = self.nova_client.servers.get(self.server_id)
-                if not self.server_status_matches(['SHUTDOWN', 'ACTIVE'],
-                                                  server=server):
-                    LOG.warning("Server %(vm_id)s entered ERROR status "
-                                "when deleting instance %(instance_id)s!",
-                                {'vm_id': self.server_id,
-                                 'instance_id': self.id})
+                LOG.debug(f"Compute server {self.server_id} status "
+                          f"{server.status}")
                 return False
             except nova_exceptions.NotFound:
                 return True
@@ -785,15 +881,17 @@ class BaseInstance(SimpleInstance):
                             "Timeout deleting compute server %(vm_id)s",
                             {'instance_id': self.id, 'vm_id': self.server_id})
 
-        # If volume has been resized it must be manually removed
-        try:
-            if self.volume_id:
-                volume = self.volume_client.volumes.get(self.volume_id)
-                if volume.status == "available":
-                    volume.delete()
-        except Exception as e:
-            LOG.warning("Failed to delete volume for instance %s, error: %s",
-                        self.id, six.text_type(e))
+        # Cinder volume.
+        vols = self.volume_client.volumes.list(
+            search_opts={'name': f'trove-{self.id}'})
+        for vol in vols:
+            LOG.info(f"Deleting volume {vol.id} for instance {self.id}")
+
+            try:
+                vol.delete()
+            except Exception as e:
+                LOG.warning(f"Failed to delete volume {vol.id}({vol.status}) "
+                            f"for instance {self.id}, error: {str(e)}")
 
         notification.TroveInstanceDelete(
             instance=self,
@@ -807,8 +905,13 @@ class BaseInstance(SimpleInstance):
         deleted_at = timeutils.utcnow()
         self._delete_resources(deleted_at)
         LOG.debug("Setting instance %s to be deleted.", self.id)
+        # Also set FOREIGN KEY fields to NULL
         self.update_db(deleted=True, deleted_at=deleted_at,
-                       task_status=InstanceTasks.NONE)
+                       task_status=InstanceTasks.NONE,
+                       datastore_version_id=None,
+                       configuration_id=None,
+                       slave_of_id=None,
+                       cluster_id=None)
         self.set_servicestatus_deleted()
         self.set_instance_fault_deleted()
 
@@ -826,43 +929,62 @@ class BaseInstance(SimpleInstance):
     @property
     def nova_client(self):
         if not self._nova_client:
-            self._nova_client = create_nova_client(
+            self._nova_client = clients.create_nova_client(
                 self.context, region_name=self.db_info.region_id)
         return self._nova_client
 
     def update_db(self, **values):
         self.db_info = DBInstance.find_by(id=self.id, deleted=False)
+
+        if 'access' in values and type(values['access'] != str):
+            values['access'] = json.dumps(values['access'])
+
         for key in values:
             setattr(self.db_info, key, values[key])
         self.db_info.save()
 
     def set_servicestatus_deleted(self):
         del_instance = InstanceServiceStatus.find_by(instance_id=self.id)
-        del_instance.set_status(tr_instance.ServiceStatuses.DELETED)
+        del_instance.set_status(srvstatus.ServiceStatuses.DELETED)
+        del_instance.save()
+
+    def set_servicestatus_restart(self):
+        del_instance = InstanceServiceStatus.find_by(instance_id=self.id)
+        del_instance.set_status(srvstatus.ServiceStatuses.RESTARTING)
         del_instance.save()
 
     def set_instance_fault_deleted(self):
         try:
             del_fault = DBInstanceFault.find_by(instance_id=self.id)
             del_fault.deleted = True
-            del_fault.deleted_at = datetime.utcnow()
+            del_fault.deleted_at = timeutils.utcnow()
             del_fault.save()
         except exception.ModelNotFoundError:
             pass
 
+    def get_flavor(self):
+        return self.nova_client.flavors.get(self.flavor_id)
+
     @property
     def volume_client(self):
         if not self._volume_client:
-            self._volume_client = create_cinder_client(
+            self._volume_client = clients.create_cinder_client(
                 self.context, region_name=self.db_info.region_id)
         return self._volume_client
 
     @property
     def neutron_client(self):
         if not self._neutron_client:
-            self._neutron_client = create_neutron_client(
+            self._neutron_client = clients.create_neutron_client(
                 self.context, region_name=self.db_info.region_id)
         return self._neutron_client
+
+    @property
+    def user_neutron_client(self):
+        if not self._user_neutron_client:
+            self._user_neutron_client = clients.neutron_client(
+                self.context, region_name=self.db_info.region_id)
+        return self._user_neutron_client
 
     def reset_task_status(self):
         self.update_db(task_status=InstanceTasks.NONE)
@@ -876,7 +998,55 @@ class BaseInstance(SimpleInstance):
             self._server_group_loaded = True
         return self._server_group
 
-    def get_injected_files(self, datastore_manager):
+    def prepare_cloud_config(self, files):
+        # This method returns None if the files argument is None
+        if not files:
+            return ""
+
+        injected_config_owner = CONF.get('injected_config_owner')
+        injected_config_group = CONF.get('injected_config_group')
+
+        write_files = []
+        for filename, content in files.items():
+            ud = encodeutils.safe_encode(content)
+            write_files.append({
+                "encoding": "b64",
+                "owner": f"{injected_config_owner}:{injected_config_group}",
+                "path": filename,
+                "content": encodeutils.safe_decode(base64.b64encode(ud))
+            })
+
+        cloud_config = {
+            "write_files": write_files
+        }
+        return CLOUDINIT_HEADER + yaml.dump(cloud_config)
+
+    @property
+    def datastore_registry_ext(self):
+        registry_ext = constants.REGISTRY_EXT_DEFAULTS.get(
+            self.ds_version.manager)
+        if self.ds_version.registry_ext:
+            registry_ext = self.ds_version.registry_ext
+
+        return "%(manager)s:%(registry_ext)s" % {
+            "manager": self.ds_version.manager,
+            "registry_ext": registry_ext
+        }
+
+    @property
+    def datastore_repl_strategy(self):
+        if self.ds_version.repl_strategy:
+            return self.ds_version.repl_strategy
+
+        return "%s.%s" % (
+            CONF.get(self.ds_version.manager).replication_namespace,
+            CONF.get(self.ds_version.manager).replication_strategy
+        )
+
+    def get_injected_files(self,
+                           datastore_manager,
+                           datastore_version,
+                           networks=None):
         injected_config_location = CONF.get('injected_config_location')
         guest_info = CONF.get('guest_info')
 
@@ -888,13 +1058,28 @@ class BaseInstance(SimpleInstance):
             guest_info_file = os.path.join(injected_config_location,
                                            guest_info)
 
-        files = {guest_info_file: (
-            "[DEFAULT]\n"
-            "guest_id=%s\n"
-            "datastore_manager=%s\n"
-            "tenant_id=%s\n"
-            % (self.id, datastore_manager, self.tenant_id))}
+        files = {
+            guest_info_file: (
+                "[DEFAULT]\n"
+                "guest_id=%s\n"
+                "datastore_manager=%s\n"
+                "datastore_version=%s\n"
+                "tenant_id=%s\n"
+                "datastore_registry_ext=%s\n"
+                "replication_strategy=%s\n"
+                "ssl_mode=%s\n"
+                % (self.id, datastore_manager, datastore_version,
+                   self.tenant_id, self.datastore_registry_ext,
+                   self.datastore_repl_strategy, self.db_info.ssl_mode)
+            )
+        }
 
+        # pass through the network_isolation to guest
+        files = {
+            guest_info_file: ("%snetwork_isolation=%s\n" %
+                              (files.get(guest_info_file),
+                               CONF.network.network_isolation))
+        }
         instance_key = get_instance_encryption_key(self.id)
         if instance_key:
             files = {
@@ -907,7 +1092,94 @@ class BaseInstance(SimpleInstance):
                 files[os.path.join(injected_config_location,
                                    "trove-guestagent.conf")] = f.read()
 
+        # For trove guest agent service init in dev mode
+        # Before Nova version 2.57, userdata is not supported when doing
+        # rebuild, have to use injected files instead.
+        if CONF.controller_address:
+            files['/etc/trove/controller.conf'] = (
+                f"CONTROLLER={CONF.controller_address}"
+            )
+
+        disable_bridge = False
+        if CONF.network.network_isolation:
+            user_port_id = None
+
+            if networks is not None:
+                if len(networks) > 1:
+                    # The user defined port is always the first one.
+                    user_port_id = networks[0]["port-id"]
+            else:
+                user_network_id = None
+                for address in self.addresses or []:
+                    if address.get("type") == "private" and \
+                       address.get("network"):
+                        user_network_id = address["network"]
+                        break
+
+                if user_network_id:
+                    ret = self.neutron_client.list_ports(
+                        name='trove-%s' % self.id,
+                        network_id=user_network_id)
+                    ports = ret.get("ports", [])
+                    if ports:
+                        user_port_id = ports[0]["id"]
+
+            if user_port_id:
+                nic_info = self._get_user_nic_info(user_port_id)
+                LOG.debug("Generate the eth1_config.json file: %s", nic_info)
+                files[constants.ETH1_CONFIG_PATH] = json.dumps(nic_info)
+                disable_bridge = True
+
+        # Since Victoria, guest agent uses docker.
+        # Configure docker's daemon.json if the directives exist in trove.conf
+        docker_daemon_values = {}
+
+        # In case that user enables network_isolation with management/bussiness
+        # network not set
+        if CONF.network.network_isolation and disable_bridge:
+            docker_daemon_values["bridge"] = "none"
+            docker_daemon_values["ip-forward"] = False
+            docker_daemon_values["iptables"] = False
+        else:
+            # Configure docker_bridge_network_ip in order to change the docker
+            # default range(172.17.0.0/16) of bridge network
+            if CONF.docker_bridge_network_ip:
+                docker_daemon_values["bip"] = CONF.docker_bridge_network_ip
+        if CONF.docker_insecure_registries:
+            docker_daemon_values["insecure-registries"] = \
+                CONF.docker_insecure_registries
+
+        if docker_daemon_values:
+            files['/etc/docker/daemon.json'] = (
+                json.dumps(docker_daemon_values)
+            )
+
         return files
+
+    def _get_user_nic_info(self, port_id):
+        nic_info = dict()
+        port = self.neutron_client.show_port(port_id)
+        fixed_ips = port['port']["fixed_ips"]
+        nic_info["mac_address"] = port['port']["mac_address"]
+        for fixed_ip in fixed_ips:
+            subnet = self.neutron_client.show_subnet(
+                fixed_ip["subnet_id"])['subnet']
+            if subnet.get("ip_version") == 4:
+                nic_info["ipv4_address"] = fixed_ip.get("ip_address")
+                nic_info["ipv4_cidr"] = subnet.get("cidr")
+                nic_info["ipv4_gateway"] = subnet.get("gateway_ip")
+                nic_info["ipv4_host_routes"] = subnet.get("host_routes")
+            # NOTE: only if the ipv6_ra_mode is dhcpv6-stateful,
+            # we need to configure the ip route for container. for slaac
+            # and dhcpv6-stateless mode, the route will be configured
+            # by the nic itself via the RA protocol.
+            elif subnet.get("ip_version") == 6:
+                nic_info["ipv6_address"] = fixed_ip.get("ip_address")
+                nic_info["ipv6_cidr"] = subnet.get("cidr")
+                nic_info["ipv6_host_routes"] = subnet.get("host_routes")
+                if subnet.get("ipv6_ra_mode") == "dhcpv6-stateful":
+                    nic_info["ipv6_gateway"] = subnet.get("gateway_ip")
+        return nic_info
 
     def reset_status(self):
         LOG.info("Resetting the status to ERROR on instance %s.",
@@ -915,17 +1187,55 @@ class BaseInstance(SimpleInstance):
         self.reset_task_status()
 
         reset_instance = InstanceServiceStatus.find_by(instance_id=self.id)
-        reset_instance.set_status(tr_instance.ServiceStatuses.UNKNOWN)
+        reset_instance.set_status(srvstatus.ServiceStatuses.UNKNOWN)
         reset_instance.save()
+
+    def set_service_status(self, status):
+        reset_instance = InstanceServiceStatus.find_by(instance_id=self.id)
+        reset_instance.set_status(status)
+        reset_instance.save()
+
+    def prepare_userdata(self, datastore_manager):
+        userdata = None
+        cloudinit = os.path.join(CONF.get('cloudinit_location'),
+                                 "%s.cloudinit" % datastore_manager)
+        if os.path.isfile(cloudinit):
+            with open(cloudinit, "r") as f:
+                userdata = f.read()
+        return userdata
+
+    @staticmethod
+    def combine_cloudinit_userdata(cloudinit, userdata):
+        cloudinit = yaml.safe_load(cloudinit)
+        try:
+            # in case the userdata is not a valid yaml
+            userdata = yaml.safe_load(userdata)
+        except yaml.YAMLError as e:
+            LOG.error("Failed to parse userdata: %s. The error was: %s",
+                      userdata,
+                      str(e))
+            return CLOUDINIT_HEADER + yaml.dump(cloudinit)
+        if isinstance(userdata, dict):
+            # in case the userdata contains write_files directive
+            if userdata.get('write_files') and cloudinit.get('write_files'):
+                cloudinit['write_files'].extend(userdata['write_files'])
+                userdata.pop('write_files')
+            cloudinit.update(userdata)
+        else:
+            LOG.error("Userdata is not a valid cloudinit config: %s",
+                      userdata)
+        return CLOUDINIT_HEADER + yaml.dump(cloudinit)
 
 
 class FreshInstance(BaseInstance):
+
     @classmethod
     def load(cls, context, id):
         return load_instance(cls, context, id, needs_server=False)
 
 
 class BuiltInstance(BaseInstance):
+
     @classmethod
     def load(cls, context, id, needs_server=True):
         return load_instance(cls, context, id, needs_server=needs_server)
@@ -953,8 +1263,8 @@ class Instance(BuiltInstance):
     @classmethod
     def _validate_remote_datastore(cls, context, region_name, flavor,
                                    datastore, datastore_version):
-        remote_nova_client = create_nova_client(context,
-                                                region_name=region_name)
+        remote_nova_client = clients.create_nova_client(
+            context, region_name=region_name)
         try:
             remote_flavor = remote_nova_client.flavors.get(flavor.id)
             if (flavor.ram != remote_flavor.ram or
@@ -987,9 +1297,9 @@ class Instance(BuiltInstance):
                 "Datastore Version %(dsv)s not found in region %(remote)s."
                 % {'dsv': datastore_version.name, 'remote': region_name})
 
-        glance_client = create_glance_client(context)
+        glance_client = clients.create_glance_client(context)
         local_image = glance_client.images.get(datastore_version.image)
-        remote_glance_client = create_glance_client(
+        remote_glance_client = clients.create_glance_client(
             context, region_name=region_name)
         remote_image = remote_glance_client.images.get(
             remote_ds_ver.image)
@@ -1007,9 +1317,12 @@ class Instance(BuiltInstance):
                availability_zone=None, nics=None,
                configuration_id=None, slave_of_id=None, cluster_config=None,
                replica_count=None, volume_type=None, modules=None,
-               locality=None, region_name=None, access=None):
-
-        region_name = region_name or CONF.service_credentials.region_name
+               locality=None, region_name=None, access=None,
+               ssl_mode=None, ssl_ref=None):
+        nova_client = clients.create_nova_client(context)
+        cinder_client = clients.create_cinder_client(context)
+        datastore_cfg = CONF.get(datastore_version.manager)
+        volume_support = datastore_cfg.volume_support
 
         call_args = {
             'name': name,
@@ -1019,7 +1332,10 @@ class Instance(BuiltInstance):
             'image_id': image_id,
             'availability_zone': availability_zone,
             'region_name': region_name,
+            'locality': locality
         }
+        if cluster_config:
+            call_args['cluster_id'] = cluster_config.get("id", None)
 
         # All nova flavors are permitted for a datastore-version unless one
         # or more entries are found in datastore_version_metadata,
@@ -1032,16 +1348,17 @@ class Instance(BuiltInstance):
             valid_flavors = tuple(f.value for f in bound_flavors)
             if flavor_id not in valid_flavors:
                 raise exception.DatastoreFlavorAssociationNotFound(
-                    datastore=datastore.name,
-                    datastore_version=datastore_version.name,
-                    flavor_id=flavor_id)
-
-        datastore_cfg = CONF.get(datastore_version.manager)
-        client = create_nova_client(context)
+                    datastore_version_id=datastore_version.id,
+                    id=flavor_id)
         try:
-            flavor = client.flavors.get(flavor_id)
+            flavor = nova_client.flavors.get(flavor_id)
         except nova_exceptions.NotFound:
             raise exception.FlavorNotFound(uuid=flavor_id)
+
+        replica_source = None
+        if slave_of_id:
+            replica_source = DBInstance.find_by(
+                context, id=slave_of_id, deleted=False)
 
         # If a different region is specified for the instance, ensure
         # that the flavor and image are the same in both regions
@@ -1049,14 +1366,24 @@ class Instance(BuiltInstance):
             cls._validate_remote_datastore(context, region_name, flavor,
                                            datastore, datastore_version)
 
-        deltas = {'instances': 1}
-        volume_support = datastore_cfg.volume_support
+        deltas = {'instances': 1, 'ram': flavor.ram}
         if volume_support:
-            call_args['volume_type'] = volume_type
+            if replica_source:
+                try:
+                    volume = cinder_client.volumes.get(
+                        replica_source.volume_id)
+                except Exception as e:
+                    LOG.error(f'Failed to get volume from Cinder, error: '
+                              f'{str(e)}')
+                    raise exception.NotFound(uuid=replica_source.volume_id)
+                volume_type = volume.volume_type
+                volume_size = volume.size
+
             dvm.validate_volume_type(context, volume_type,
-                                     datastore.name, datastore_version.name)
-            call_args['volume_size'] = volume_size
+                                     datastore_version.id)
             validate_volume_size(volume_size)
+            call_args['volume_type'] = volume_type
+            call_args['volume_size'] = volume_size
             deltas['volumes'] = volume_size
             # Instance volume should have enough space for the backup
             # Backup, and volume sizes are in GBs
@@ -1071,10 +1398,12 @@ class Instance(BuiltInstance):
                 target_size = flavor.ephemeral  # ephemeral_Storage
 
         if backup_id:
-            Backup.verify_swift_auth_token(context)
+            backup_info = Backup.get_by_id(context, backup_id)
+
+            if backup_info.storage_driver == 'swift':
+                Backup.verify_swift_auth_token(context)
 
             call_args['backup_id'] = backup_id
-            backup_info = Backup.get_by_id(context, backup_id)
             if not backup_info.is_done_successfuly:
                 raise exception.BackupNotCompleteError(
                     backup_id=backup_id, state=backup_info.state)
@@ -1083,7 +1412,7 @@ class Instance(BuiltInstance):
                 raise exception.BackupTooLarge(
                     backup_size=backup_info.size, disk_size=target_size)
 
-            if not backup_info.check_swift_object_exist(
+            if not backup_info.check_location_exist(
                     context,
                     verify_checksum=CONF.verify_swift_checksum_on_restore):
                 raise exception.BackupFileNotFound(
@@ -1096,72 +1425,48 @@ class Instance(BuiltInstance):
                     datastore2=datastore.name)
 
         if slave_of_id:
-            Backup.verify_swift_auth_token(context)
-
-            if databases or users:
-                raise exception.ReplicaCreateWithUsersDatabasesError()
             call_args['replica_of'] = slave_of_id
             call_args['replica_count'] = replica_count
+
             replication_support = datastore_cfg.replication_strategy
             if not replication_support:
                 raise exception.ReplicationNotSupported(
                     datastore=datastore.name)
-            try:
-                # looking for replica source
-                replica_source = DBInstance.find_by(
+            if (CONF.verify_replica_volume_size
+                    and replica_source.volume_size > volume_size):
+                raise exception.Forbidden(
+                    _("Replica volume size should not be smaller than"
+                      " master's, replica volume size: %(replica_size)s"
+                      " and master volume size: %(master_size)s.")
+                    % {'replica_size': volume_size,
+                       'master_size': replica_source.volume_size})
+            # load the replica source status to check if
+            # source is available
+            load_simple_instance_server_status(
+                context,
+                replica_source)
+            replica_source_instance = Instance(
+                context, replica_source,
+                None,
+                InstanceServiceStatus.find_by(
                     context,
-                    id=slave_of_id,
-                    deleted=False)
-                if replica_source.slave_of_id:
-                    raise exception.Forbidden(
-                        _("Cannot create a replica of a replica %(id)s.")
-                        % {'id': slave_of_id})
-                if (CONF.verify_replica_volume_size
-                        and replica_source.volume_size > volume_size):
-                    raise exception.Forbidden(
-                        _("Replica volume size should not be smaller than"
-                          " master's, replica volume size: %(replica_size)s"
-                          " and master volume size: %(master_size)s.")
-                        % {'replica_size': volume_size,
-                           'master_size': replica_source.volume_size})
-                # load the replica source status to check if
-                # source is available
-                load_simple_instance_server_status(
-                    context,
-                    replica_source)
-                replica_source_instance = Instance(
-                    context, replica_source,
-                    None,
-                    InstanceServiceStatus.find_by(
-                        context,
-                        instance_id=slave_of_id))
-                replica_source_instance.validate_can_perform_action()
-            except exception.ModelNotFoundError:
-                LOG.exception(
-                    "Cannot create a replica of %(id)s "
-                    "as that instance could not be found.",
-                    {'id': slave_of_id})
-                raise exception.NotFound(uuid=slave_of_id)
-        elif replica_count and replica_count != 1:
-            raise exception.Forbidden(_(
-                "Replica count only valid when creating replicas. Cannot "
-                "create %(count)d instances.") % {'count': replica_count})
+                    instance_id=slave_of_id))
+            replica_source_instance.validate_can_perform_action()
+            ssl_mode = replica_source_instance.db_info.ssl_mode
+            ssl_ref = replica_source_instance.db_info.ssl_ref
+
         multi_replica = slave_of_id and replica_count and replica_count > 1
         instance_count = replica_count if multi_replica else 1
-        if locality:
-            call_args['locality'] = locality
 
         if not nics:
             nics = []
         if CONF.management_networks:
             # Make sure management network interface is always configured after
             # user defined instance.
-            nics = nics + [{"net-id": net_id}
+            nics = nics + [{"network_id": net_id}
                            for net_id in CONF.management_networks]
         if nics:
             call_args['nics'] = nics
-        if cluster_config:
-            call_args['cluster_id'] = cluster_config.get("id", None)
 
         if not modules:
             modules = []
@@ -1177,7 +1482,6 @@ class Instance(BuiltInstance):
         module_list = module_views.convert_modules_to_list(modules)
 
         def _create_resources():
-
             if cluster_config:
                 cluster_id = cluster_config.get("id", None)
                 shard_id = cluster_config.get("shard_id", None)
@@ -1199,18 +1503,17 @@ class Instance(BuiltInstance):
                     configuration_id=configuration_id,
                     slave_of_id=slave_of_id, cluster_id=cluster_id,
                     shard_id=shard_id, type=instance_type,
-                    region_id=region_name)
-                LOG.debug("Tenant %(tenant)s created new Trove instance "
-                          "%(db)s in region %(region)s.",
-                          {'tenant': context.project_id, 'db': db_info.id,
-                           'region': region_name})
-
+                    region_id=region_name, access=access,
+                    ssl_mode=ssl_mode, ssl_ref=ssl_ref)
                 instance_id = db_info.id
-                cls.add_instance_modules(context, instance_id, modules)
                 instance_name = name
+                LOG.debug(f"Creating new instance {instance_id}")
                 ids.append(instance_id)
                 names.append(instance_name)
                 root_passwords.append(None)
+
+                cls.add_instance_modules(context, instance_id, modules)
+
                 # change the name to be name + replica_number if more than one
                 if multi_replica:
                     replica_number = instance_index + 1
@@ -1221,15 +1524,15 @@ class Instance(BuiltInstance):
                 # if a configuration group is associated with an instance,
                 # generate an overrides dict to pass into the instance creation
                 # method
-
                 config = Configuration(context, configuration_id)
                 overrides = config.get_configuration_overrides()
+
                 service_status = InstanceServiceStatus.create(
                     instance_id=instance_id,
-                    status=tr_instance.ServiceStatuses.NEW)
+                    status=srvstatus.ServiceStatuses.NEW)
 
                 if CONF.trove_dns_support:
-                    dns_client = create_dns_client(context)
+                    dns_client = clients.create_dns_client(context)
                     hostname = dns_client.determine_hostname(instance_id)
                     db_info.hostname = hostname
                     db_info.save()
@@ -1243,13 +1546,15 @@ class Instance(BuiltInstance):
                 instance_id = ids
                 instance_name = names
                 root_password = root_passwords
+
             task_api.API(context).create_instance(
                 instance_id, instance_name, flavor, image_id, databases, users,
                 datastore_version.manager, datastore_version.packages,
                 volume_size, backup_id, availability_zone, root_password,
                 nics, overrides, slave_of_id, cluster_config,
                 volume_type=volume_type, modules=module_list,
-                locality=locality, access=access)
+                locality=locality, access=access,
+                ds_version=datastore_version.version)
 
             return SimpleInstance(context, db_info, service_status,
                                   root_password, locality=locality)
@@ -1263,9 +1568,6 @@ class Instance(BuiltInstance):
         for module in modules:
             module_models.InstanceModule.create(
                 context, instance_id, module.id, module.md5)
-
-    def get_flavor(self):
-        return self.nova_client.flavors.get(self.flavor_id)
 
     def get_default_configuration_template(self):
         flavor = self.get_flavor()
@@ -1284,13 +1586,13 @@ class Instance(BuiltInstance):
         if self.db_info.cluster_id is not None:
             raise exception.ClusterInstanceOperationNotSupported()
 
-        # Validate that the old and new flavor IDs are not the same, new flavor
-        # can be found and has ephemeral/volume support if required by the
-        # current flavor.
+        # Validate that the old and new flavor IDs are not the same, new
+        # flavor can be found and has ephemeral/volume support if required
+        # by the current flavor.
         if self.flavor_id == new_flavor_id:
-            raise exception.BadRequest(_("The new flavor id must be different "
-                                         "than the current flavor id of '%s'.")
-                                       % self.flavor_id)
+            raise exception.BadRequest(
+                _("The new flavor id must be different "
+                  "than the current flavor id of '%s'.") % self.flavor_id)
         try:
             new_flavor = self.nova_client.flavors.get(new_flavor_id)
         except nova_exceptions.NotFound:
@@ -1303,44 +1605,66 @@ class Instance(BuiltInstance):
         elif self.device_path is not None:
             # ephemeral support enabled
             if new_flavor.ephemeral == 0:
-                raise exception.LocalStorageNotSpecified(flavor=new_flavor_id)
+                raise exception.LocalStorageNotSpecified(
+                    flavor=new_flavor_id)
 
-        # Set the task to RESIZING and begin the async call before returning.
-        self.update_db(task_status=InstanceTasks.RESIZING)
-        LOG.debug("Instance %s set to RESIZING.", self.id)
-        task_api.API(self.context).resize_flavor(self.id, old_flavor,
-                                                 new_flavor)
+        def _resize_flavor():
+            # Set the task to RESIZING and begin the async call before
+            # returning.
+            self.update_db(task_status=InstanceTasks.RESIZING)
+            LOG.debug("Instance %s set to RESIZING.", self.id)
+            task_api.API(self.context).resize_flavor(self.id, old_flavor,
+                                                     new_flavor)
+
+        return run_with_quotas(self.tenant_id,
+                               {'ram': new_flavor.ram - old_flavor.ram},
+                               _resize_flavor)
 
     def resize_volume(self, new_size):
-        def _resize_resources():
-            self.validate_can_perform_action()
-            LOG.info("Resizing volume of instance %s.", self.id)
-            if self.db_info.cluster_id is not None:
-                raise exception.ClusterInstanceOperationNotSupported()
-            old_size = self.volume_size
-            if int(new_size) <= old_size:
-                raise exception.BadRequest(_("The new volume 'size' must be "
-                                             "larger than the current volume "
-                                             "size of '%s'.") % old_size)
-            # Set the task to Resizing before sending off to the taskmanager
-            self.update_db(task_status=InstanceTasks.RESIZING)
-            task_api.API(self.context).resize_volume(new_size, self.id)
+        """Resize instance volume.
 
+        If the instance is primary in a replication cluster, volumes of all the
+        replicas are also resized.
+        """
+
+        def _resize_resources(instance):
+            LOG.info("Resizing volume of instance %s.", instance.id)
+            instance.update_db(task_status=InstanceTasks.RESIZING)
+            task_api.API(self.context).resize_volume(new_size, instance.id)
+
+        new_size_l = int(new_size)
+
+        if self.db_info.cluster_id is not None:
+            raise exception.ClusterInstanceOperationNotSupported()
         if not self.volume_size:
             raise exception.BadRequest(_("Instance %s has no volume.")
                                        % self.id)
-        new_size_l = int(new_size)
+        if new_size_l <= self.volume_size:
+            raise exception.BadRequest(_("The new volume 'size' must be "
+                                         "larger than the current volume "
+                                         "size of '%s'.") % self.volume_size)
         validate_volume_size(new_size_l)
-        return run_with_quotas(self.tenant_id,
-                               {'volumes': new_size_l - self.volume_size},
-                               _resize_resources)
+        self.validate_can_perform_action()
+
+        instances = [self]
+        for dbinfo in self.slaves:
+            replica = Instance.load(self.context, dbinfo.id, needs_server=True)
+            replica.validate_can_perform_action()
+            instances.append(replica)
+
+        for instance in instances:
+            run_with_quotas(
+                self.tenant_id, {'volumes': new_size_l - self.volume_size},
+                _resize_resources, instance)
 
     def reboot(self):
-        self.validate_can_perform_action()
         LOG.info("Rebooting instance %s.", self.id)
         if self.db_info.cluster_id is not None and not self.context.is_admin:
             raise exception.ClusterInstanceOperationNotSupported()
+
         self.update_db(task_status=InstanceTasks.REBOOTING)
+        self.set_servicestatus_restart()
+
         task_api.API(self.context).reboot(self.id)
 
     def restart(self):
@@ -1348,13 +1672,10 @@ class Instance(BuiltInstance):
         LOG.info("Restarting datastore on instance %s.", self.id)
         if self.db_info.cluster_id is not None and not self.context.is_admin:
             raise exception.ClusterInstanceOperationNotSupported()
-        # Set our local status since Nova might not change it quick enough.
-        # TODO(tim.simpson): Possible bad stuff can happen if this service
-        #                   shuts down before it can set status to NONE.
-        #                   We need a last updated time to mitigate this;
-        #                   after some period of tolerance, we'll assume the
-        #                   status is no longer in effect.
+
         self.update_db(task_status=InstanceTasks.REBOOTING)
+        self.set_servicestatus_restart()
+
         task_api.API(self.context).restart(self.id)
 
     def detach_replica(self):
@@ -1385,13 +1706,13 @@ class Instance(BuiltInstance):
         task_api.API(self.context).promote_to_replica_source(self.id)
 
     def eject_replica_source(self):
-        self.validate_can_perform_action()
         LOG.info("Ejecting replica source %s from its replication set.",
                  self.id)
 
         if not self.slaves:
             raise exception.BadRequest(_("Instance %s is not a replica"
-                                       " source.") % self.id)
+                                         " source.") % self.id)
+
         service = InstanceServiceStatus.find_by(instance_id=self.id)
         last_heartbeat_delta = timeutils.utcnow() - service.updated_at
         agent_expiry_interval = timedelta(seconds=CONF.agent_heartbeat_expiry)
@@ -1466,10 +1787,10 @@ class Instance(BuiltInstance):
                                                  status=status)
 
     def attach_configuration(self, configuration_id):
-        LOG.debug("Attaching configuration to instance: %s", self.id)
+        LOG.info("Attaching configuration %s to instance: %s",
+                 configuration_id, self.id)
         if not self.db_info.configuration_id:
             self._validate_can_perform_assign()
-            LOG.debug("Attaching configuration: %s", configuration_id)
             config = Configuration.find(self.context, configuration_id,
                                         self.db_info.datastore_version_id)
             self.update_configuration(config)
@@ -1489,7 +1810,8 @@ class Instance(BuiltInstance):
         to RESTART_REQUIRED.
         """
 
-        LOG.debug("Saving configuration on instance: %s", self.id)
+        LOG.info("Saving configuration %s on instance: %s",
+                 configuration.configuration_id, self.id)
         overrides = configuration.get_configuration_overrides()
 
         # Always put the instance into RESTART_REQUIRED state after
@@ -1513,8 +1835,8 @@ class Instance(BuiltInstance):
         Apply changes only if ALL values can be applied at once.
         Return True if the configuration has changed.
         """
-
-        LOG.debug("Applying configuration on instance: %s", self.id)
+        LOG.info("Applying configuration %s on instance: %s",
+                 configuration.configuration_id, self.id)
         overrides = configuration.get_configuration_overrides()
 
         if not configuration.does_configuration_need_restart():
@@ -1532,7 +1854,7 @@ class Instance(BuiltInstance):
         return False
 
     def detach_configuration(self):
-        LOG.debug("Detaching configuration from instance: %s", self.id)
+        LOG.info("Detaching configuration from instance: %s", self.id)
         if self.configuration and self.configuration.id:
             self._validate_can_perform_assign()
             LOG.debug("Detaching configuration: %s", self.configuration.id)
@@ -1612,6 +1934,14 @@ class Instance(BuiltInstance):
         task_api.API(self.context).upgrade(self.id,
                                            datastore_version.id)
 
+    def rebuild(self, image_id):
+        self.update_db(task_status=InstanceTasks.BUILDING)
+        task_api.API(self.context).rebuild(self.id, image_id)
+
+    def update_access(self, access):
+        self.update_db(task_status=InstanceTasks.UPDATING)
+        task_api.API(self.context).update_access(self.id, access)
+
 
 def create_server_list_matcher(server_list):
     # Returns a method which finds a server from the given list.
@@ -1646,8 +1976,7 @@ class Instances(object):
 
         if context is None:
             raise TypeError(_("Argument context not defined."))
-        client = create_nova_client(context)
-        servers = client.servers.list()
+        client = clients.create_nova_client(context)
         query_opts = {'tenant_id': context.project_id,
                       'deleted': False}
         if not include_clustered:
@@ -1664,6 +1993,14 @@ class Instances(object):
                                                   limit=limit,
                                                   marker=context.marker)
         next_marker = data_view.next_page_marker
+
+        if client.api_version >= api_versions.APIVersion('2.26'):
+            # Utilize nova tags feature
+            server_ids = [f'trove_instance_id_{i.id}' for i in db_infos]
+            servers = client.servers.list(
+                search_opts={'tags-any': ','.join(server_ids)}, limit=-1)
+        else:
+            servers = client.servers.list(limit=-1)
 
         find_server = create_server_list_matcher(servers)
         for db in db_infos:
@@ -1698,42 +2035,45 @@ class Instances(object):
         for db in db_items:
             server = None
             try:
-                # TODO(tim.simpson): Delete when we get notifications working!
                 if InstanceTasks.BUILDING == db.task_status:
                     db.server_status = "BUILD"
-                    db.addresses = {}
+                    db.addresses = []
                 else:
                     try:
                         region = CONF.service_credentials.region_name
                         if (not db.region_id or db.region_id == region):
                             server = find_server(db.id, db.compute_instance_id)
                         else:
-                            nova_client = create_nova_client(
+                            nova_client = clients.create_nova_client(
                                 context, region_name=db.region_id)
                             server = nova_client.servers.get(
                                 db.compute_instance_id)
                         db.server_status = server.status
-                        db.addresses = server.addresses
+
+                        load_simple_instance_addresses(context, db)
                     except exception.ComputeInstanceNotFound:
                         db.server_status = "SHUTDOWN"  # Fake it...
-                        db.addresses = {}
-                # TODO(tim.simpson): End of hack.
+                        db.addresses = []
 
-                # volumes = find_volumes(server.id)
-                datastore_status = InstanceServiceStatus.find_by(
+                service_status = InstanceServiceStatus.find_by(
                     instance_id=db.id)
-                if not datastore_status.status:  # This should never happen.
+                if not service_status.status:  # This should never happen.
                     LOG.error("Server status could not be read for "
                               "instance id(%s).", db.id)
                     continue
-                LOG.debug("Server api_status(%s).",
-                          datastore_status.status.api_status)
+
+                # Get the real-time service status.
+                LOG.debug('Task status for instance %s: %s', db.id,
+                          db.task_status)
+                update_service_status(db.task_status, service_status, db.id)
             except exception.ModelNotFoundError:
                 LOG.error("Server status could not be read for "
                           "instance id(%s).", db.id)
                 continue
-            ret.append(load_instance(context, db, datastore_status,
-                                     server=server))
+
+            ret.append(
+                load_instance(context, db, service_status, server=server)
+            )
         return ret
 
 
@@ -1745,7 +2085,8 @@ class DBInstance(dbmodels.DatabaseModelBase):
                     'volume_size', 'tenant_id', 'server_status',
                     'deleted', 'deleted_at', 'datastore_version_id',
                     'configuration_id', 'slave_of_id', 'cluster_id',
-                    'shard_id', 'type', 'region_id', 'encrypted_key']
+                    'shard_id', 'type', 'region_id', 'encrypted_key', 'access',
+                    'ssl_mode', 'ssl_ref']
     _table_name = 'instances'
 
     def __init__(self, task_status, **kwargs):
@@ -1780,6 +2121,12 @@ class DBInstance(dbmodels.DatabaseModelBase):
         return cu.decrypt_data(cu.decode_data(self.encrypted_key),
                                CONF.inst_rpc_key_encr_key)
 
+    @classmethod
+    def create(cls, **values):
+        if 'access' in values and type(values['access'] != str):
+            values['access'] = json.dumps(values['access'])
+        return super(DBInstance, cls).create(**values)
+
     def _validate(self, errors):
         if InstanceTask.from_code(self.task_id) is None:
             errors['task_id'] = "Not valid."
@@ -1797,6 +2144,7 @@ class DBInstance(dbmodels.DatabaseModelBase):
 
 
 class instance_encryption_key_cache(object):
+
     def __init__(self, func, lru_cache_size=10):
         self._table = {}
         self._lru = []
@@ -1818,7 +2166,7 @@ class instance_encryption_key_cache(object):
                 return val
 
             # We need string anyway
-            if isinstance(val, six.binary_type):
+            if isinstance(val, bytes):
                 val = encodeutils.safe_decode(val)
 
             if len(self._lru) == self._lru_cache_size:
@@ -1866,22 +2214,23 @@ def module_instance_count(context, module_id, include_clustered=False):
                func.max(module_models.DBInstanceModule.updated)]
     filters = [module_models.DBInstanceModule.module_id == module_id,
                module_models.DBInstanceModule.deleted == 0]
-    query = module_models.DBInstanceModule.query()
-    query = query.join(
-        module_models.DBModule,
-        module_models.DBInstanceModule.module_id == module_models.DBModule.id)
-    query = query.join(
-        DBInstance,
-        module_models.DBInstanceModule.instance_id == DBInstance.id)
-    if not include_clustered:
-        filters.append(DBInstance.cluster_id.is_(None))
-    if not context.is_admin:
-        filters.append(DBInstance.tenant_id == context.project_id)
-    query = query.group_by(module_models.DBInstanceModule.md5)
-    query = query.add_columns(*columns)
-    query = query.filter(*filters)
-    query = query.order_by(module_models.DBInstanceModule.updated)
-    return query.all()
+    with module_models.DBInstanceModule.query() as query:
+        query = query.join(
+            module_models.DBModule,
+            module_models.DBInstanceModule.module_id ==
+            module_models.DBModule.id)
+        query = query.join(
+            DBInstance,
+            module_models.DBInstanceModule.instance_id == DBInstance.id)
+        if not include_clustered:
+            filters.append(DBInstance.cluster_id.is_(None))
+        if not context.is_admin:
+            filters.append(DBInstance.tenant_id == context.project_id)
+        query = query.group_by(module_models.DBInstanceModule.md5)
+        query = query.add_columns(*columns)
+        query = query.filter(*filters)
+        query = query.order_by(module_models.DBInstanceModule.updated)
+        return query.all()
 
 
 def persist_instance_fault(notification, event_qualifier):
@@ -1958,7 +2307,7 @@ class InstanceServiceStatus(dbmodels.DatabaseModelBase):
     def _validate(self, errors):
         if self.status is None:
             errors['status'] = "Cannot be None."
-        if tr_instance.ServiceStatus.from_code(self.status_id) is None:
+        if srvstatus.ServiceStatus.from_code(self.status_id) is None:
             errors['status_id'] = "Not valid."
 
     def get_status(self):
@@ -1969,7 +2318,7 @@ class InstanceServiceStatus(dbmodels.DatabaseModelBase):
         status of the service
         :rtype: trove.common.instance.ServiceStatus
         """
-        return tr_instance.ServiceStatus.from_code(self.status_id)
+        return srvstatus.ServiceStatus.from_code(self.status_id)
 
     def set_status(self, value):
         """
@@ -1984,6 +2333,15 @@ class InstanceServiceStatus(dbmodels.DatabaseModelBase):
         self['updated_at'] = timeutils.utcnow()
         return get_db_api().save(self)
 
+    def is_uptodate(self):
+        """Check if the service status heartbeat is up to date."""
+        heartbeat_expiry = timedelta(seconds=CONF.agent_heartbeat_expiry)
+        last_update = (timeutils.utcnow() - self.updated_at)
+        if last_update < heartbeat_expiry:
+            return True
+
+        return False
+
     status = property(get_status, set_status)
 
 
@@ -1996,6 +2354,6 @@ def persisted_models():
 
 
 MYSQL_RESPONSIVE_STATUSES = [
-    tr_instance.ServiceStatuses.RUNNING,
-    tr_instance.ServiceStatuses.HEALTHY
+    srvstatus.ServiceStatuses.RUNNING,
+    srvstatus.ServiceStatuses.HEALTHY
 ]

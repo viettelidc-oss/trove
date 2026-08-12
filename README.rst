@@ -3,7 +3,6 @@ Trove
 =====
 
 .. image:: https://governance.openstack.org/tc/badges/trove.svg
-    :target: https://governance.openstack.org/tc/reference/tags/index.html
 
 Trove is Database as a Service for OpenStack.
 
@@ -24,7 +23,7 @@ CONTRIBUTING.rst_ and HACKING.rst_
 * `Developer Docs <https://docs.openstack.org/trove/latest/>`_
 
 You can raise bugs here:
-`Bug Tracker <https://storyboard.openstack.org/#!/project/openstack/trove>`_
+`Bug Tracker <https://bugs.launchpad.net/trove>`_
 
 The plan for trove can be found at
 `Trove Specs <https://specs.openstack.org/openstack/trove-specs/>`_
@@ -40,7 +39,7 @@ Python-troveclient_ is a client for Trove.
 
 Dashboard plugin
 ----------------
-Trove-dashboard_ is OpenStack dashbaord plugin for Trove.
+Trove-dashboard_ is OpenStack dashboard plugin for Trove.
 
 .. _Trove-dashboard: https://opendev.org/openstack/trove-dashboard
 
@@ -51,6 +50,6 @@ References
 * `Manual installation docs`_
 * `Build guest image`_
 
-.. _Installation docs: https://docs.openstack.org/trove/latest/install/install.html
-.. _Manual installation docs: https://docs.openstack.org/trove/latest/install/manual_install.html
+.. _Installation docs: https://docs.openstack.org/trove/latest/install/
+.. _Manual installation docs: https://docs.openstack.org/trove/latest/install/install-manual.html
 .. _Build guest image: https://docs.openstack.org/trove/latest/admin/building_guest_images.html

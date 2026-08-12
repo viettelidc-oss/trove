@@ -24,17 +24,19 @@ import trove.common.apischema as apischema
 from trove.common import cfg
 from trove.common import clients
 from trove.common import exception
+from trove.common import glance as common_glance
 from trove.common.i18n import _
 from trove.common import neutron
 from trove.common import notification
 from trove.common.notification import StartNotification
 from trove.common import pagination
 from trove.common import policy
+from trove.common import ssl
 from trove.common import utils
 from trove.common import wsgi
-from trove.datastore import models as datastore_models
-from trove.extensions.mysql.common import populate_users
-from trove.extensions.mysql.common import populate_validated_databases
+from trove.datastore import models as ds_models
+from trove.extensions.common.common import populate_users
+from trove.extensions.common.common import populate_validated_databases
 from trove.instance import models, views
 from trove.module import models as module_models
 from trove.module import views as module_views
@@ -250,11 +252,11 @@ class InstanceController(wsgi.Controller):
         LOG.debug("req : '%s'\n\n", req)
 
         context = req.environ[wsgi.CONTEXT_KEY]
-        server = models.load_instance_with_info(models.DetailInstance,
-                                                context, id)
-        self.authorize_instance_action(context, 'show', server)
+        instance = models.load_instance_with_info(models.DetailInstance,
+                                                  context, id)
+        self.authorize_instance_action(context, 'show', instance)
         return wsgi.Result(
-            views.InstanceDetailView(server, req=req).data(), 200
+            views.InstanceDetailView(instance, req=req).data(), 200
         )
 
     def delete(self, req, tenant_id, id):
@@ -279,41 +281,167 @@ class InstanceController(wsgi.Controller):
                         instance_module['module_id'])
                     module_models.InstanceModule.delete(
                         context, instance_module)
+            try:
+                if instance.db_info['ssl_mode'] and \
+                   instance.db_info['ssl_mode'] != 'None':
+                    # (mangust404) The problem here that to correctly remove
+                    # consumer, the context should be a project's owner.
+                    # Barbican doesn't allow to manage secrets/consumers
+                    # even for admins.
+                    # If you run instance delettion as admin, secret consumers
+                    # cannot be updated.
+                    ssl_client = ssl.TroveSSL(context)
+                    ssl_client.disable_instance_ssl(instance)
+            except Exception as e:
+                LOG.warning(
+                    "Unable to remove consumer for key %s on %s deletion: %s",
+                    instance.db_info['ssl_ref'], instance.id, e,
+                    exc_info=True)
             instance.delete()
+
         return wsgi.Result(None, 202)
 
-    def _check_network_overlap(self, context, user_network):
+    def _check_nic(self, context, nic):
+        """Check user provided nic.
+
+        :param context: User context.
+        :param nic: A dict may contain network_id(net-id), subnet_id or
+            ip_address.
+        """
         neutron_client = clients.create_neutron_client(context)
-        user_cidrs = neutron.get_subnet_cidrs(neutron_client, user_network)
+        network_id = nic.get('network_id', nic.get('net-id'))
+        subnet_id = nic.get('subnet_id')
+        ip_address = nic.get('ip_address')
+
+        if not network_id and not subnet_id:
+            raise exception.NetworkNotProvided(resource='network or subnet')
+
+        if not subnet_id and ip_address:
+            raise exception.NetworkNotProvided(resource='subnet')
+
+        if subnet_id:
+            actual_network = neutron_client.show_subnet(
+                subnet_id)['subnet']['network_id']
+            if network_id and actual_network != network_id:
+                raise exception.SubnetNotFound(subnet_id=subnet_id,
+                                               network_id=network_id)
+            network_id = actual_network
+
+        nic['network_id'] = network_id
+        nic.pop('net-id', None)
+        if not CONF.network.network_isolation:
+            self._check_network_overlap(context, network_id, subnet_id)
+
+    def _check_network_overlap(self, context, user_network=None,
+                               user_subnet=None):
+        """Check if the network contains IP address belongs to reserved
+        network.
+
+        :param context: User context.
+        :param user_network: Network ID.
+        :param user_subnet: Subnet ID.
+        """
+        neutron_client = clients.create_neutron_client(context)
+        user_cidrs = neutron.get_subnet_cidrs(neutron_client, user_network,
+                                              user_subnet)
+
+        reserved_cidrs = CONF.reserved_network_cidrs
         mgmt_cidrs = neutron.get_mamangement_subnet_cidrs(neutron_client)
-        LOG.debug("Cidrs of the user network: %s, cidrs of the management "
-                  "network: %s", user_cidrs, mgmt_cidrs)
+        reserved_cidrs.extend(mgmt_cidrs)
+
+        LOG.debug("Cidrs of the user network: %s, cidrs of the reserved "
+                  "network: %s", user_cidrs, reserved_cidrs)
+
         for user_cidr in user_cidrs:
             user_net = ipaddress.ip_network(user_cidr)
-            for mgmt_cidr in mgmt_cidrs:
-                mgmt_net = ipaddress.ip_network(mgmt_cidr)
-                if user_net.overlaps(mgmt_net):
+            for reserved_cidr in reserved_cidrs:
+                res_net = ipaddress.ip_network(reserved_cidr)
+                if user_net.overlaps(res_net):
                     raise exception.NetworkConflict()
 
     def create(self, req, body, tenant_id):
-        # TODO(hub-cap): turn this into middleware
         LOG.info("Creating a database instance for tenant '%s'",
                  tenant_id)
         LOG.debug("req : '%s'\n\n", strutils.mask_password(req))
         LOG.debug("body : '%s'\n\n", strutils.mask_password(body))
         context = req.environ[wsgi.CONTEXT_KEY]
         policy.authorize_on_tenant(context, 'instance:create')
-        context.notification = notification.DBaaSInstanceCreate(context,
-                                                                request=req)
-        datastore_args = body['instance'].get('datastore', {})
-        datastore, datastore_version = (
-            datastore_models.get_datastore_version(**datastore_args))
-        image_id = datastore_version.image_id
+        context.notification = notification.DBaaSInstanceCreate(
+            context, request=req)
+
         name = body['instance']['name']
-        flavor_ref = body['instance']['flavorRef']
+        slave_of_id = body['instance'].get('replica_of')
+        replica_count = body['instance'].get('replica_count')
+        flavor_ref = body['instance'].get('flavorRef')
+        datastore_args = body['instance'].get('datastore', {})
+        volume_info = body['instance'].get('volume', {})
+        availability_zone = body['instance'].get('availability_zone')
+        nics = body['instance'].get('nics', [])
+        locality = body['instance'].get('locality')
+        region_name = body['instance'].get(
+            'region_name', CONF.service_credentials.region_name
+        )
+        access = body['instance'].get('access', None)
+
+        if slave_of_id:
+            if flavor_ref:
+                msg = 'Cannot specify flavor when creating replicas.'
+                raise exception.BadRequest(message=msg)
+            if datastore_args:
+                msg = 'Cannot specify datastore when creating replicas.'
+                raise exception.BadRequest(message=msg)
+            if volume_info:
+                msg = 'Cannot specify volume when creating replicas.'
+                raise exception.BadRequest(message=msg)
+            if locality:
+                msg = 'Cannot specify locality when creating replicas.'
+                raise exception.BadRequest(message=msg)
+            if CONF.storage_strategy in ["swift"]:
+                backup_model.verify_swift_auth_token(context)
+        else:
+            if replica_count and replica_count > 1:
+                msg = (f"Replica count only valid when creating replicas. "
+                       f"Cannot create {replica_count} instances.")
+                raise exception.BadRequest(message=msg)
+
         flavor_id = utils.get_id_from_href(flavor_ref)
 
-        configuration = self._configuration_parse(context, body)
+        if volume_info:
+            volume_size = int(volume_info.get('size'))
+            volume_type = volume_info.get('type')
+        else:
+            volume_size = None
+            volume_type = None
+
+        if slave_of_id:
+            try:
+                replica_source = models.DBInstance.find_by(
+                    context, id=slave_of_id, deleted=False)
+                flavor_id = replica_source.flavor_id
+            except exception.ModelNotFoundError:
+                LOG.error(f"Cannot create a replica of {slave_of_id} as that "
+                          f"instance could not be found.")
+                raise exception.NotFound(uuid=slave_of_id)
+            if replica_source.slave_of_id:
+                raise exception.Forbidden(
+                    f"Cannot create a replica of a replica {slave_of_id}")
+
+            datastore_version = ds_models.DatastoreVersion.load_by_uuid(
+                replica_source.datastore_version_id)
+            datastore = ds_models.Datastore.load(
+                datastore_version.datastore_id)
+        else:
+            datastore, datastore_version = ds_models.get_datastore_version(
+                **datastore_args)
+
+        # If only image_tags is configured in the datastore version, get
+        # the image ID using the tags.
+        glance_client = clients.create_glance_client(context)
+        image_id = common_glance.get_image_id(
+            glance_client, datastore_version.image_id,
+            datastore_version.image_tags)
+        LOG.info(f'Using image {image_id} for creating instance')
+
         databases = populate_validated_databases(
             body['instance'].get('databases', []))
         database_names = [database.get('_name', '') for database in databases]
@@ -322,8 +450,11 @@ class InstanceController(wsgi.Controller):
             users = populate_users(body['instance'].get('users', []),
                                    database_names)
         except ValueError as ve:
-            raise exception.BadRequest(message=ve)
+            raise exception.BadRequest(message=str(ve))
+        if slave_of_id and (databases or users):
+            raise exception.ReplicaCreateWithUsersDatabasesError()
 
+        configuration = self._configuration_parse(context, body)
         modules = body['instance'].get('modules')
 
         # The following operations have their own API calls.
@@ -343,49 +474,32 @@ class InstanceController(wsgi.Controller):
             policy.authorize_on_tenant(
                 context, 'instance:extension:database:create')
 
-        if 'volume' in body['instance']:
-            volume_info = body['instance']['volume']
-            volume_size = int(volume_info['size'])
-            volume_type = volume_info.get('type')
-        else:
-            volume_size = None
-            volume_type = None
-
         if 'restorePoint' in body['instance']:
             backupRef = body['instance']['restorePoint']['backupRef']
             backup_id = utils.get_id_from_href(backupRef)
         else:
             backup_id = None
 
-        availability_zone = body['instance'].get('availability_zone')
-
-        nics = body['instance'].get('nics', [])
+        # Only 1 nic is allowed as defined in API jsonschema.
+        # Use list just for backward compatibility.
         if len(nics) > 0:
-            self._check_network_overlap(context, nics[0].get('net-id'))
+            nic = nics[0]
+            LOG.info('Checking user provided instance network %s', nic)
+            if slave_of_id and nic.get('ip_address'):
+                msg = "Cannot specify IP address when creating replicas."
+                raise exception.BadRequest(message=msg)
+            self._check_nic(context, nic)
 
-        slave_of_id = body['instance'].get('replica_of',
-                                           # also check for older name
-                                           body['instance'].get('slave_of'))
-        replica_count = body['instance'].get('replica_count')
-        locality = body['instance'].get('locality')
         if locality:
-            locality_domain = ['affinity', 'anti-affinity']
+            locality_domain = [
+                'affinity', 'soft-affinity',
+                'anti-affinity', 'soft-anti-affinity']
             locality_domain_msg = ("Invalid locality '%s'. "
                                    "Must be one of ['%s']" %
                                    (locality,
                                     "', '".join(locality_domain)))
             if locality not in locality_domain:
                 raise exception.BadRequest(message=locality_domain_msg)
-            if slave_of_id:
-                dupe_locality_msg = (
-                    'Cannot specify locality when adding replicas to existing '
-                    'master.')
-                raise exception.BadRequest(message=dupe_locality_msg)
-
-        region_name = body['instance'].get(
-            'region_name', CONF.service_credentials.region_name
-        )
-        access = body['instance'].get('access', None)
 
         instance = models.Instance.create(context, name, flavor_id,
                                           image_id, databases, users,
@@ -400,6 +514,12 @@ class InstanceController(wsgi.Controller):
                                           region_name=region_name,
                                           access=access)
 
+        if slave_of_id and replica_source.ssl_mode and \
+           replica_source.ssl_mode != 'None':
+            ssl_client = ssl.TroveSSL(context)
+            ssl_client.enable_instance_ssl(
+                instance, replica_source.ssl_mode, replica_source.ssl_ref)
+
         view = views.InstanceDetailView(instance, req=req)
         return wsgi.Result(view.data(), 200)
 
@@ -409,14 +529,15 @@ class InstanceController(wsgi.Controller):
             if configuration_ref:
                 configuration_id = utils.get_id_from_href(configuration_ref)
                 return configuration_id
+            return None
 
     def _modify_instance(self, context, req, instance, **kwargs):
         if 'detach_replica' in kwargs and kwargs['detach_replica']:
-            LOG.debug("Detaching replica from source.")
             context.notification = notification.DBaaSInstanceDetach(
                 context, request=req)
             with StartNotification(context, instance_id=instance.id):
                 instance.detach_replica()
+
         if 'configuration_id' in kwargs:
             if kwargs['configuration_id']:
                 context.notification = (
@@ -432,19 +553,31 @@ class InstanceController(wsgi.Controller):
                                                                   request=req))
                 with StartNotification(context, instance_id=instance.id):
                     instance.detach_configuration()
+
         if 'datastore_version' in kwargs:
-            datastore_version = datastore_models.DatastoreVersion.load(
+            datastore_version = ds_models.DatastoreVersion.load(
                 instance.datastore, kwargs['datastore_version'])
+
+            if datastore_version.name == instance.ds_version.name:
+                LOG.warning(f"Same datastore version {datastore_version.name} "
+                            f"for upgrading")
+
             context.notification = (
                 notification.DBaaSInstanceUpgrade(context, request=req))
             with StartNotification(context, instance_id=instance.id,
                                    datastore_version_id=datastore_version.id):
                 instance.upgrade(datastore_version)
-        if kwargs:
-            instance.update_db(**kwargs)
+
+        if 'access' in kwargs:
+            instance.update_access(kwargs['access'])
 
     def update(self, req, id, body, tenant_id):
-        """Updates the instance to attach/detach configuration."""
+        """Updates the instance.
+
+        - attach/detach configuration.
+        - detach from primary.
+        - access information.
+        """
         LOG.info("Updating database instance '%(instance_id)s' for tenant "
                  "'%(tenant_id)s'",
                  {'instance_id': id, 'tenant_id': tenant_id})
@@ -452,41 +585,47 @@ class InstanceController(wsgi.Controller):
         LOG.debug("body: %s", body)
         context = req.environ[wsgi.CONTEXT_KEY]
 
+        name = body['instance'].get('name')
+        if ((name and len(body['instance'].keys()) > 2) or
+                (not name and len(body['instance'].keys()) >= 2)):
+            raise exception.BadRequest("Only one attribute (except 'name') is "
+                                       "allowed to update.")
+
         instance = models.Instance.load(context, id)
         self.authorize_instance_action(context, 'update', instance)
 
-        # Make sure args contains a 'configuration_id' argument,
         args = {}
-        args['configuration_id'] = self._configuration_parse(context, body)
+        if name:
+            instance.update_db(name=name)
+
+        detach_replica = ('replica_of' in body['instance'] or
+                          'slave_of' in body['instance'])
+        if detach_replica:
+            args['detach_replica'] = detach_replica
+
+        if 'configuration' in body['instance']:
+            configuration_id = self._configuration_parse(context, body)
+            args['configuration_id'] = configuration_id
+
+        # if body['instance'] is empty, set configuration_id to None
+        if not body['instance']:
+            args['configuration_id'] = None
+
+        if 'access' in body['instance']:
+            args['access'] = body['instance']['access']
+
+        if 'datastore_version' in body['instance']:
+            args['datastore_version'] = body['instance']['datastore_version']
+
         self._modify_instance(context, req, instance, **args)
         return wsgi.Result(None, 202)
 
     def edit(self, req, id, body, tenant_id):
+        """Updates the instance to set or unset one or more attributes.
+
+        Deprecated. Use update method instead.
         """
-        Updates the instance to set or unset one or more attributes.
-        """
-        LOG.info("Editing instance for tenant id %s.", tenant_id)
-        LOG.debug("req: %s", strutils.mask_password(req))
-        LOG.debug("body: %s", strutils.mask_password(body))
-        context = req.environ[wsgi.CONTEXT_KEY]
-
-        instance = models.Instance.load(context, id)
-        self.authorize_instance_action(context, 'edit', instance)
-
-        args = {}
-        args['detach_replica'] = ('replica_of' in body['instance'] or
-                                  'slave_of' in body['instance'])
-
-        if 'name' in body['instance']:
-            args['name'] = body['instance']['name']
-        if 'configuration' in body['instance']:
-            args['configuration_id'] = self._configuration_parse(context, body)
-        if 'datastore_version' in body['instance']:
-            args['datastore_version'] = body['instance'].get(
-                'datastore_version')
-
-        self._modify_instance(context, req, instance, **args)
-        return wsgi.Result(None, 202)
+        return self.update(req, id, body, tenant_id)
 
     def configuration(self, req, tenant_id, id):
         """
@@ -546,6 +685,135 @@ class InstanceController(wsgi.Controller):
         guest_log = client.guest_log_action(log_name, enable, disable,
                                             publish, discard)
         return wsgi.Result({'log': guest_log}, 200)
+
+    def ssl_show(self, req, tenant_id, id):
+        """Show information about SSL for an instance."""
+        LOG.debug("Showing SSL status for tenant %s", tenant_id)
+        context = req.environ[wsgi.CONTEXT_KEY]
+
+        instance = models.Instance.load(context, id)
+        if not instance:
+            raise exception.NotFound(uuid=id)
+        self.authorize_instance_action(context, 'show', instance)
+        client = clients.create_guest_client(context, id)
+        ssl_info = client.ssl_show()
+        if instance.db_info.ssl_mode and \
+           instance.db_info.ssl_mode != 'None':
+            ssl_info['mode'] = instance.db_info.ssl_mode
+        else:
+            ssl_info['mode'] = ssl.MODE_BUILTIN
+        include_cert = strutils.bool_from_string(
+            req.GET.get('include_certificate'))
+        if not include_cert and 'certificate' in ssl_info and \
+           'payload' in ssl_info['certificate']:
+            del ssl_info['certificate']['payload']
+        return wsgi.Result({'ssl': ssl_info}, 200)
+
+    def ssl_action(self, req, body, tenant_id, id):
+        LOG.info("SSL action for tenant %s", tenant_id)
+        context = req.environ[wsgi.CONTEXT_KEY]
+        instance = models.Instance.load(context, id)
+        if not instance:
+            raise exception.NotFound(uuid=id)
+
+        instance.validate_can_perform_action()
+        self.authorize_instance_action(context, 'update', instance)
+
+        client = clients.create_guest_client(context, id)
+
+        container_ref = body['ssl'].get('container_ref', None)
+        password_ref = body['ssl'].get('password_ref', None)
+        enable = body['ssl'].get('enable', None)
+        if enable and not container_ref:
+            raise exception.BadRequest(
+                "You should provide container_ref for enabling ssl.")
+        disable = body['ssl'].get('disable', None)
+        rollback = body['ssl'].get('rollback', None)
+
+        actions = [enable, disable, rollback]
+        if sum(1 for op in actions if op) > 1:
+            raise exception.BadRequest(
+                "Cannot do several operations at once.")
+
+        # Rolling back for replica is allowed, to cover edge cases
+        if rollback:
+            LOG.debug(
+                "Rolling back SSL configuration for tenant %s", tenant_id)
+            result = client.ssl_rollback()
+            # Write real guest mode into database
+            if 'mode' in result:
+                instance.db_info.ssl_mode = result['mode']
+                instance.db_info.save()
+            return wsgi.Result({'ssl': result}, 200)
+
+        if instance.slave_of_id:
+            raise exception.BadRequest(
+                "Unable to modify ssl on the replica. "
+                "Please perform the action on the primary instead.")
+
+        mode = body['ssl'].get('mode', ssl.MODE_BASIC)
+        if mode not in (ssl.MODE_BASIC,
+                        ssl.MODE_ENFORCED, ssl.MODE_MTLS):
+            raise exception.BadRequest(
+                "Unknown SSL mode. Available options are: "
+                "%s, %s, %s" % (
+                    ssl.MODE_BASIC, ssl.MODE_ENFORCED, ssl.MODE_MTLS))
+
+        container = None
+        ssl_client = ssl.TroveSSL(context)
+
+        if container_ref:
+            # Get certificate container from Barbican.
+            container = ssl_client.get_p12_bundle(container_ref, password_ref)
+
+        replicas = []
+        replica_clients = {}
+
+        for dbinfo in instance.slaves:
+            replica = models.Instance.load(
+                context, dbinfo.id, needs_server=True)
+
+            replica.validate_can_perform_action()
+            self.authorize_instance_action(
+                context, 'update', replica)
+
+            replicas.append(replica)
+            replica_clients[replica.id] = (
+                clients.create_guest_client(context, replica.id))
+
+        instances = [instance] + replicas
+        completed = []
+
+        # Define the actual task to be passed into transaction wrapper
+        def _execute_guest_ssl_actions():
+            ssl_info = client.ssl_action(mode, container, enable, disable)
+            completed.append(client)
+            for replica in replicas:
+                replica_clients[replica.id].ssl_action(
+                    mode, container, enable, disable)
+                completed.append(replica_clients[replica.id])
+            return ssl_info
+
+        # Define the rollback task to be passed into transaction wrapper
+        def _rollback_guest_ssl_actions():
+            error = None
+            for guest in reversed(completed):
+                try:
+                    guest.ssl_rollback()
+                except Exception as exc:
+                    LOG.exception(
+                        "Failed to rollback guest SSL configuration: %s",
+                        exc)
+                    if error is None:
+                        error = exc
+            if error:
+                raise error
+
+        ssl_info = ssl.run_ssl_state_transaction(
+            ssl_client, instances, mode, container_ref, enable, disable,
+            _execute_guest_ssl_actions, _rollback_guest_ssl_actions)
+
+        return wsgi.Result({'ssl': ssl_info}, 200)
 
     def module_list(self, req, tenant_id, id):
         """Return information about modules on an instance."""

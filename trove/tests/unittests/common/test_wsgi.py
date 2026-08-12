@@ -13,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
-from mock import Mock, patch
+from unittest.mock import Mock, patch
 from testtools.matchers import Equals, Is, Not
 import webob.exc
 
@@ -42,7 +42,7 @@ class TestWsgi(trove_testtools.TestCase):
         # assertions
         ctx = req.environ[wsgi.CONTEXT_KEY]
         self.assertThat(ctx, Not(Is(None)))
-        self.assertThat(ctx.user, Equals(user_id))
+        self.assertThat(ctx.user_id, Equals(user_id))
         self.assertThat(ctx.auth_token, Equals(token))
         self.assertEqual(0, len(ctx.service_catalog))
 

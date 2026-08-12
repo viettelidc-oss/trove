@@ -16,11 +16,14 @@
 import abc
 import os
 import re
-import six
+
+from oslo_log import log as logging
 
 from trove.guestagent.common import guestagent_utils
 from trove.guestagent.common import operating_system
 from trove.guestagent.common.operating_system import FileMode
+
+LOG = logging.getLogger(__name__)
 
 
 class ConfigurationManager(object):
@@ -76,6 +79,11 @@ class ConfigurationManager(object):
                                     implementation changes in the future.
         :type override_strategy     ConfigurationOverrideStrategy
         """
+        base_config_dir = os.path.dirname(base_config_path)
+        operating_system.ensure_directory(
+            base_config_dir, user=owner, group=group, force=True, as_root=True
+        )
+
         self._base_config_path = base_config_path
         self._owner = owner
         self._group = group
@@ -96,11 +104,14 @@ class ConfigurationManager(object):
         self._override_strategy.configure(
             base_config_path, owner, group, codec, requires_root)
 
-    def get_value(self, key, default=None):
+    def get_value(self, key, section=None, default=None):
         """Return the current value at a given key or 'default'.
         """
         if self._value_cache is None:
             self.refresh_cache()
+
+        if section:
+            return self._value_cache.get(section, {}).get(key, default)
 
         return self._value_cache.get(key, default)
 
@@ -111,29 +122,36 @@ class ConfigurationManager(object):
         :returns:        Configuration file as a Python dict.
         """
 
-        base_options = operating_system.read_file(
-            self._base_config_path, codec=self._codec,
-            as_root=self._requires_root)
+        try:
+            base_options = operating_system.read_file(
+                self._base_config_path, codec=self._codec,
+                as_root=self._requires_root)
+        except Exception:
+            LOG.warning('File %s not found', self._base_config_path)
+            return None
 
         updates = self._override_strategy.parse_updates()
         guestagent_utils.update_dict(updates, base_options)
 
         return base_options
 
-    def save_configuration(self, options):
+    def reset_configuration(self, options, remove_overrides=False):
         """Write given contents to the base configuration file.
-        Remove all existing overrides (both system and user).
 
-        :param contents        Contents of the configuration file.
-        :type contents         string or dict
+        Remove all existing overrides (both system and user) as required.
+
+        :param options: Contents of the configuration file (string or dict).
+        :param remove_overrides: Remove the overrides or not.
         """
         if isinstance(options, dict):
             # Serialize a dict of options for writing.
-            self.save_configuration(self._codec.serialize(options))
+            self.reset_configuration(self._codec.serialize(options),
+                                     remove_overrides=remove_overrides)
         else:
-            self._override_strategy.remove(self.USER_GROUP)
-            self._override_strategy.remove(self.SYSTEM_PRE_USER_GROUP)
-            self._override_strategy.remove(self.SYSTEM_POST_USER_GROUP)
+            if remove_overrides:
+                self._override_strategy.remove(self.USER_GROUP)
+                self._override_strategy.remove(self.SYSTEM_PRE_USER_GROUP)
+                self._override_strategy.remove(self.SYSTEM_POST_USER_GROUP)
 
             operating_system.write_file(
                 self._base_config_path, options, as_root=self._requires_root)
@@ -211,8 +229,7 @@ class ConfigurationManager(object):
         self._value_cache = self.parse_configuration()
 
 
-@six.add_metaclass(abc.ABCMeta)
-class ConfigurationOverrideStrategy(object):
+class ConfigurationOverrideStrategy(object, metaclass=abc.ABCMeta):
     """ConfigurationOverrideStrategy handles configuration files.
     The strategy provides functionality to enumerate, apply and remove
     configuration overrides.
@@ -335,6 +352,8 @@ class ImportOverrideStrategy(ConfigurationOverrideStrategy):
         self._codec = codec
         self._requires_root = requires_root
 
+        self._initialize_import_directory()
+
     def exists(self, group_name, change_id):
         return self._find_revision_file(group_name, change_id) is not None
 
@@ -368,7 +387,7 @@ class ImportOverrideStrategy(ConfigurationOverrideStrategy):
         """Lazy-initialize the directory for imported revision files.
         """
         if not os.path.exists(self._revision_dir):
-            operating_system.create_directory(
+            operating_system.ensure_directory(
                 self._revision_dir, user=self._owner, group=self._group,
                 force=True, as_root=self._requires_root)
 
@@ -401,6 +420,7 @@ class ImportOverrideStrategy(ConfigurationOverrideStrategy):
                                                  as_root=self._requires_root)
             guestagent_utils.update_dict(options, parsed_options)
 
+        LOG.debug(f"Parsed overrides options: {parsed_options}")
         return parsed_options
 
     @property

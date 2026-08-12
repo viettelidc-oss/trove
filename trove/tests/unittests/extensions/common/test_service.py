@@ -14,8 +14,9 @@
 #    under the License.
 #
 
-from mock import Mock
-from mock import patch
+from unittest.mock import Mock
+from unittest.mock import patch
+
 from oslo_config.cfg import NoSuchOptError
 
 from trove.common import exception
@@ -61,8 +62,8 @@ class TestDefaultRootController(trove_testtools.TestCase):
     def test_root_create(self, root_create):
         user = Mock()
         context = Mock()
-        context.user = Mock()
-        context.user.__getitem__ = Mock(return_value=user)
+        context.user_id = Mock()
+        context.user_id.__getitem__ = Mock(return_value=user)
         req = Mock()
         req.environ = Mock()
         req.environ.__getitem__ = Mock(return_value=context)
@@ -376,8 +377,8 @@ class TestClusterRootController(trove_testtools.TestCase):
     @patch.object(models.ClusterRoot, "create")
     def test_instance_root_create(self, mock_cluster_root_create):
         user = Mock()
-        self.context.user = Mock()
-        self.context.user.__getitem__ = Mock(return_value=user)
+        self.context.user_id = Mock()
+        self.context.user_id.__getitem__ = Mock(return_value=user)
         req = Mock()
         req.environ = {'trove.context': self.context}
         password = Mock()
@@ -393,8 +394,8 @@ class TestClusterRootController(trove_testtools.TestCase):
     @patch.object(models.ClusterRoot, "create")
     def test_instance_root_create_no_body(self, mock_cluster_root_create):
         user = Mock()
-        self.context.user = Mock()
-        self.context.user.__getitem__ = Mock(return_value=user)
+        self.context.user_id = Mock()
+        self.context.user_id.__getitem__ = Mock(return_value=user)
         req = Mock()
         req.environ = {'trove.context': self.context}
         password = None

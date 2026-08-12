@@ -13,19 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cinderclient.v2 import client as CinderClient
+from cinderclient import client as CinderClient
 import glanceclient
 from keystoneauth1 import loading
 from keystoneauth1 import session
 from neutronclient.v2_0 import client as NeutronClient
 from novaclient.client import Client as NovaClient
+from oslo_log import log as logging
 import swiftclient
 
 from trove.common import cfg
 from trove.common.clients import normalize_url
 
+LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
 _SESSION = None
+ADMIN_NEUTRON_CLIENT = None
+ADMIN_NOVA_CLIENT = None
+ADMIN_CINDER_CLIENT = None
 
 
 def get_keystone_session():
@@ -41,7 +46,10 @@ def get_keystone_session():
             user_domain_name=CONF.service_credentials.user_domain_name,
             project_domain_name=CONF.service_credentials.project_domain_name,
             auth_url=CONF.service_credentials.auth_url)
-        _SESSION = session.Session(auth=auth)
+        insecure = getattr(CONF.keystone_authtoken, 'insecure', False)
+        cafile = getattr(CONF.keystone_authtoken, 'cafile', None)
+        verify = False if insecure else (cafile or True)
+        _SESSION = session.Session(auth=auth, verify=verify)
 
     return _SESSION
 
@@ -54,9 +62,14 @@ def nova_client_trove_admin(context, region_name=None, password=None):
     :return novaclient: novaclient with trove admin credentials
     :rtype: novaclient.client.Client
     """
+    global ADMIN_NOVA_CLIENT
+
+    if ADMIN_NOVA_CLIENT:
+        LOG.debug('Re-use admin nova client')
+        return ADMIN_NOVA_CLIENT
 
     ks_session = get_keystone_session()
-    client = NovaClient(
+    ADMIN_NOVA_CLIENT = NovaClient(
         CONF.nova_client_version,
         session=ks_session,
         service_type=CONF.nova_compute_service_type,
@@ -65,11 +78,11 @@ def nova_client_trove_admin(context, region_name=None, password=None):
         endpoint_type=CONF.nova_compute_endpoint_type)
 
     if CONF.nova_compute_url and CONF.service_credentials.project_id:
-        client.client.endpoint_override = "%s/%s/" % (
+        ADMIN_NOVA_CLIENT.client.endpoint_override = "%s/%s/" % (
             normalize_url(CONF.nova_compute_url),
             CONF.service_credentials.project_id)
 
-    return client
+    return ADMIN_NOVA_CLIENT
 
 
 def cinder_client_trove_admin(context, region_name=None):
@@ -79,20 +92,28 @@ def cinder_client_trove_admin(context, region_name=None):
     :type context: trove.common.context.TroveContext
     :return cinderclient: cinderclient with trove admin credentials
     """
+    global ADMIN_CINDER_CLIENT
+
+    if ADMIN_CINDER_CLIENT:
+        LOG.debug('Re-use admin cinder client')
+        return ADMIN_CINDER_CLIENT
+
     ks_session = get_keystone_session()
-    client = CinderClient.Client(
+    ADMIN_CINDER_CLIENT = CinderClient.Client(
+        CONF.cinder_client_version,
         session=ks_session,
         service_type=CONF.cinder_service_type,
         region_name=region_name or CONF.service_credentials.region_name,
         insecure=CONF.cinder_api_insecure,
-        endpoint_type=CONF.cinder_endpoint_type)
+        endpoint_type=CONF.cinder_endpoint_type,
+        additional_headers={'OpenStack-API-Version': 'volumev3 latest'})
 
     if CONF.cinder_url and CONF.service_credentials.project_id:
-        client.client.management_url = "%s/%s/" % (
+        ADMIN_CINDER_CLIENT.client.management_url = "%s/%s/" % (
             normalize_url(CONF.cinder_url),
             CONF.service_credentials.project_id)
 
-    return client
+    return ADMIN_CINDER_CLIENT
 
 
 def neutron_client_trove_admin(context, region_name=None):
@@ -102,8 +123,14 @@ def neutron_client_trove_admin(context, region_name=None):
     :type context: trove.common.context.TroveContext
     :return neutronclient: neutronclient with trove admin credentials
     """
+    global ADMIN_NEUTRON_CLIENT
+
+    if ADMIN_NEUTRON_CLIENT:
+        LOG.debug('Re-use admin neutron client')
+        return ADMIN_NEUTRON_CLIENT
+
     ks_session = get_keystone_session()
-    client = NeutronClient.Client(
+    ADMIN_NEUTRON_CLIENT = NeutronClient.Client(
         session=ks_session,
         service_type=CONF.neutron_service_type,
         region_name=region_name or CONF.service_credentials.region_name,
@@ -111,9 +138,9 @@ def neutron_client_trove_admin(context, region_name=None):
         endpoint_type=CONF.neutron_endpoint_type)
 
     if CONF.neutron_url:
-        client.management_url = CONF.neutron_url
+        ADMIN_NEUTRON_CLIENT.management_url = CONF.neutron_url
 
-    return client
+    return ADMIN_NEUTRON_CLIENT
 
 
 def swift_client_trove_admin(context, region_name=None):

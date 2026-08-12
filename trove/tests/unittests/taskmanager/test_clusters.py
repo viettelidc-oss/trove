@@ -15,9 +15,9 @@
 
 import datetime
 
-from mock import MagicMock
-from mock import Mock
-from mock import patch
+from unittest.mock import MagicMock
+from unittest.mock import Mock
+from unittest.mock import patch
 
 from trove.cluster.models import ClusterTasks as ClusterTaskStatus
 from trove.cluster.models import DBCluster
@@ -30,9 +30,62 @@ from trove.instance.models import DBInstance
 from trove.instance.models import Instance
 from trove.instance.models import InstanceServiceStatus
 from trove.instance.models import InstanceTasks
-# from trove.taskmanager.models import BuiltInstanceTasks
-from trove.taskmanager.models import ServiceStatuses
+from trove.instance.service_status import ServiceStatuses
 from trove.tests.unittests import trove_testtools
+
+
+class CassandraClusterTasksTest(trove_testtools.TestCase):
+    def setUp(self):
+        super(CassandraClusterTasksTest, self).setUp()
+        self.cluster_id = "1234"
+        self.cluster_name = "test1"
+        self.tenant_id = "2345"
+        self.db_cluster = DBCluster(ClusterTaskStatus.NONE,
+                                    id=self.cluster_id,
+                                    created=str(datetime.date),
+                                    updated=str(datetime.date),
+                                    name=self.cluster_name,
+                                    task_id=ClusterTaskStatus.NONE._code,
+                                    tenant_id=self.tenant_id,
+                                    datastore_version_id="1",
+                                    deleted=False)
+        self.dbinst1 = DBInstance(InstanceTasks.NONE, id="1", name="member1",
+                                  compute_instance_id="compute-1",
+                                  task_id=InstanceTasks.NONE._code,
+                                  task_description=InstanceTasks.NONE._db_text,
+                                  volume_id="volume-1",
+                                  datastore_version_id="1",
+                                  cluster_id=self.cluster_id,
+                                  shard_id="shard-1",
+                                  type="member")
+        self.dbinst2 = DBInstance(InstanceTasks.NONE, id="2", name="member2",
+                                  compute_instance_id="compute-2",
+                                  task_id=InstanceTasks.NONE._code,
+                                  task_description=InstanceTasks.NONE._db_text,
+                                  volume_id="volume-2",
+                                  datastore_version_id="1",
+                                  cluster_id=self.cluster_id,
+                                  shard_id="shard-1",
+                                  type="member")
+        mock_ds1 = Mock()
+        mock_ds1.name = 'cassandra'
+        mock_dv1 = Mock()
+        mock_dv1.name = '4.0.0'
+        self.clustertasks = ClusterTasks(Mock(),
+                                         self.db_cluster,
+                                         datastore=mock_ds1,
+                                         datastore_version=mock_dv1)
+
+    @patch.object(DBInstance, 'find_by')
+    @patch.object(InstanceServiceStatus, 'find_by')
+    def test_all_instances_healthy(self, mock_find, mock_db_find):
+        (mock_find.return_value.
+         get_status.return_value) = ServiceStatuses.HEALTHY
+        (mock_db_find.return_value.
+         get_task_status.return_value) = InstanceTasks.NONE
+        ret_val = self.clustertasks._all_instances_healthy(["1", "2"],
+                                                           self.cluster_id)
+        self.assertTrue(ret_val)
 
 
 class MongoDbClusterTasksTest(trove_testtools.TestCase):
@@ -315,7 +368,6 @@ class MongoDbClusterTasksTest(trove_testtools.TestCase):
     @patch('trove.taskmanager.models.BuiltInstanceTasks')
     @patch('trove.taskmanager.models.EndNotification')
     @patch('trove.taskmanager.models.StartNotification')
-    @patch('trove.taskmanager.models.Timeout')
     @patch.object(ClusterTasks, 'reset_task')
     @patch.object(DBInstance, 'find_all')
     def _assert_rolling_upgrade_cluster(self,
@@ -323,7 +375,6 @@ class MongoDbClusterTasksTest(trove_testtools.TestCase):
                                         ordering,
                                         mock_find_all,
                                         mock_reset_task,
-                                        mock_timeout,
                                         mock_start,
                                         mock_end,
                                         mock_instance_task,

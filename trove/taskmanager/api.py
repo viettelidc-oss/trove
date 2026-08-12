@@ -165,12 +165,26 @@ class API(object):
         self._cast("migrate", version=version,
                    instance_id=instance_id, host=host)
 
+    def rebuild(self, instance_id, image_id):
+        LOG.debug("Making async call to rebuild instance: %s", instance_id)
+        version = self.API_BASE_VERSION
+
+        self._cast("rebuild", version=version, instance_id=instance_id,
+                   image_id=image_id)
+
     def delete_instance(self, instance_id):
         LOG.debug("Making async call to delete instance: %s", instance_id)
         version = self.API_BASE_VERSION
 
         self._cast("delete_instance", version=version,
                    instance_id=instance_id)
+
+    def update_access(self, instance_id, access):
+        LOG.debug(f"Making async call to update instance: {instance_id}")
+        version = self.API_BASE_VERSION
+
+        self._cast("update_access", version=version,
+                   instance_id=instance_id, access=access)
 
     def create_backup(self, backup_info, instance_id):
         LOG.debug("Making async call to create a backup for instance: %s",
@@ -193,7 +207,8 @@ class API(object):
                         availability_zone=None, root_password=None,
                         nics=None, overrides=None, slave_of_id=None,
                         cluster_config=None, volume_type=None,
-                        modules=None, locality=None, access=None):
+                        modules=None, locality=None, access=None,
+                        ds_version=None):
 
         LOG.debug("Making async call to create instance %s ", instance_id)
         version = self.API_BASE_VERSION
@@ -214,7 +229,8 @@ class API(object):
                    slave_of_id=slave_of_id,
                    cluster_config=cluster_config,
                    volume_type=volume_type,
-                   modules=modules, locality=locality, access=access)
+                   modules=modules, locality=locality, access=access,
+                   ds_version=ds_version)
 
     def create_cluster(self, cluster_id):
         LOG.debug("Making async call to create cluster %s ", cluster_id)

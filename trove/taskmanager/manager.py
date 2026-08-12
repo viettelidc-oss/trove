@@ -44,8 +44,8 @@ class Manager(periodic_task.PeriodicTasks):
     def __init__(self):
         super(Manager, self).__init__(CONF)
         self.admin_context = TroveContext(
-            user=CONF.service_credentials.username,
-            tenant=CONF.service_credentials.project_id,
+            user_id=CONF.service_credentials.username,
+            project_id=CONF.service_credentials.project_id,
             user_domain_name=CONF.service_credentials.user_domain_name)
         if CONF.exists_notification_transformer:
             self.exists_transformer = importutils.import_object(
@@ -120,13 +120,10 @@ class Manager(periodic_task.PeriodicTasks):
             # this step took place right after step 4, which causes failures
             # with MariaDB replications.
             old_master.make_read_only(True)
-            master_ips = old_master.detach_public_ips()
-            slave_ips = master_candidate.detach_public_ips()
             latest_txn_id = old_master.get_latest_txn_id()
             master_candidate.wait_for_txn(latest_txn_id)
             master_candidate.detach_replica(old_master, for_failover=True)
             master_candidate.enable_as_master()
-            master_candidate.attach_public_ips(master_ips)
             master_candidate.make_read_only(False)
 
             # At this point, should something go wrong, there
@@ -139,7 +136,7 @@ class Manager(periodic_task.PeriodicTasks):
                 try:
                     if replica.id != master_candidate.id:
                         replica.detach_replica(old_master, for_failover=True)
-                        replica.attach_replica(master_candidate)
+                        replica.attach_replica(master_candidate, restart=True)
                 except exception.TroveError as ex:
                     log_fmt = ("Unable to migrate replica %(slave)s from "
                                "old replica source %(old_master)s to "
@@ -151,27 +148,28 @@ class Manager(periodic_task.PeriodicTasks):
                         "slave": replica.id,
                         "old_master": old_master.id,
                         "new_master": master_candidate.id}
-                    LOG.exception(log_fmt, msg_content)
+                    LOG.error(log_fmt, msg_content)
+
                     exception_replicas.append(replica)
                     error_messages += "%s (%s)\n" % (
                         exc_fmt % msg_content, ex)
 
             # dealing with the old master after all the other replicas
             # has been migrated.
-            old_master.attach_replica(master_candidate)
-            old_master.attach_public_ips(slave_ips)
+            old_master.attach_replica(master_candidate, restart=False)
             try:
                 old_master.demote_replication_master()
             except Exception as ex:
                 log_fmt = "Exception demoting old replica source %s."
                 exc_fmt = _("Exception demoting old replica source %s.")
-                LOG.exception(log_fmt, old_master.id)
+                LOG.error(log_fmt, old_master.id)
                 exception_replicas.append(old_master)
                 error_messages += "%s (%s)\n" % (
                     exc_fmt % old_master.id, ex)
 
             self._set_task_status([old_master] + replica_models,
                                   InstanceTasks.NONE)
+
             if exception_replicas:
                 self._set_task_status(exception_replicas,
                                       InstanceTasks.PROMOTION_ERROR)
@@ -183,10 +181,15 @@ class Manager(periodic_task.PeriodicTasks):
                         "err": error_messages})
                 raise ReplicationSlaveAttachError(msg)
 
+            LOG.info('Finished to promote %s as master.', instance_id)
+
         with EndNotification(context):
+            LOG.info('Promoting %s as replication master', instance_id)
+
             master_candidate = BuiltInstanceTasks.load(context, instance_id)
             old_master = BuiltInstanceTasks.load(context,
                                                  master_candidate.slave_of_id)
+
             replicas = []
             for replica_dbinfo in old_master.slaves:
                 if replica_dbinfo.id == instance_id:
@@ -211,6 +214,7 @@ class Manager(periodic_task.PeriodicTasks):
         return [[repl] + repl.get_last_txn() for repl in replica_models]
 
     def _most_current_replica(self, old_master, replica_models):
+        # last_txns is [instance, master UUID, last txn]
         last_txns = self._get_replica_txns(replica_models)
         master_ids = [txn[1] for txn in last_txns if txn[1]]
         if len(set(master_ids)) > 1:
@@ -224,14 +228,11 @@ class Manager(periodic_task.PeriodicTasks):
 
             master_candidate = self._most_current_replica(old_master,
                                                           replica_models)
+            LOG.info('New master selected: %s', master_candidate.id)
 
-            master_ips = old_master.detach_public_ips()
-            slave_ips = master_candidate.detach_public_ips()
             master_candidate.detach_replica(old_master, for_failover=True)
             master_candidate.enable_as_master()
-            master_candidate.attach_public_ips(master_ips)
             master_candidate.make_read_only(False)
-            old_master.attach_public_ips(slave_ips)
 
             exception_replicas = []
             error_messages = ""
@@ -251,10 +252,9 @@ class Manager(periodic_task.PeriodicTasks):
                         "slave": replica.id,
                         "old_master": old_master.id,
                         "new_master": master_candidate.id}
-                    LOG.exception(log_fmt, msg_content)
+                    LOG.error(log_fmt, msg_content)
                     exception_replicas.append(replica)
-                    error_messages += "%s (%s)\n" % (
-                        exc_fmt % msg_content, ex)
+                    error_messages += "%s (%s)\n" % (exc_fmt % msg_content, ex)
 
             self._set_task_status([old_master] + replica_models,
                                   InstanceTasks.NONE)
@@ -268,6 +268,8 @@ class Manager(periodic_task.PeriodicTasks):
                         "replicas": [repl.id for repl in exception_replicas],
                         "err": error_messages})
                 raise ReplicationSlaveAttachError(msg)
+
+            LOG.info('New master enabled: %s', master_candidate.id)
 
         with EndNotification(context):
             master = BuiltInstanceTasks.load(context, instance_id)
@@ -287,6 +289,10 @@ class Manager(periodic_task.PeriodicTasks):
             instance_tasks = models.BuiltInstanceTasks.load(context,
                                                             instance_id)
             instance_tasks.migrate(host)
+
+    def rebuild(self, context, instance_id, image_id):
+        instance_tasks = models.BuiltInstanceTasks.load(context, instance_id)
+        instance_tasks.rebuild(image_id)
 
     def delete_instance(self, context, instance_id):
         with EndNotification(context):
@@ -314,7 +320,8 @@ class Manager(periodic_task.PeriodicTasks):
                                   datastore_manager, packages, volume_size,
                                   availability_zone, root_password, nics,
                                   overrides, slave_of_id, backup_id,
-                                  volume_type, modules):
+                                  volume_type, modules, access=None,
+                                  ds_version=None):
 
         if type(instance_id) in [list]:
             ids = instance_id
@@ -324,7 +331,6 @@ class Manager(periodic_task.PeriodicTasks):
             root_passwords = [root_password]
         replica_number = 0
         replica_backup_id = backup_id
-        replica_backup_created = False
         replicas = []
 
         master_instance_tasks = BuiltInstanceTasks.load(context, slave_of_id)
@@ -333,50 +339,62 @@ class Manager(periodic_task.PeriodicTasks):
         LOG.debug("Using scheduler hints %s for creating instance %s",
                   scheduler_hints, instance_id)
 
+        snapshot_driver = CONF.replica_snapshot_driver or CONF.storage_strategy
+
+        # Create backup for master
+        snapshot = None
+        try:
+            instance_tasks = FreshInstanceTasks.load(context, ids[0])
+            snapshot = instance_tasks.get_replication_master_snapshot(
+                context, slave_of_id, flavor,
+                parent_backup_id=replica_backup_id,
+                snapshot_driver=snapshot_driver)
+            LOG.info('Snapshot info for creating replica of %s: %s',
+                     slave_of_id, snapshot)
+        except Exception as err:
+            LOG.error('Failed to get master snapshot info for creating '
+                      'replica, error: %s', str(err))
+
+            if snapshot and snapshot.get('dataset', {}).get('snapshot_id'):
+                backup_id = snapshot['dataset']['snapshot_id']
+                Backup.delete(context, backup_id)
+
+            raise
+
+        # Create replicas using the master backup
+        replica_backup_id = snapshot['dataset']['snapshot_id']
         try:
             for replica_index in range(0, len(ids)):
-                try:
-                    replica_number += 1
-                    LOG.debug("Creating replica %(num)d of %(count)d.",
-                              {'num': replica_number, 'count': len(ids)})
-                    instance_tasks = FreshInstanceTasks.load(
-                        context, ids[replica_index])
-                    snapshot = instance_tasks.get_replication_master_snapshot(
-                        context, slave_of_id, flavor, replica_backup_id,
-                        replica_number=replica_number)
+                replica_number += 1
+                LOG.info(f"Creating replica {replica_number} "
+                         f"({ids[replica_index]}) of {len(ids)}.")
 
-                    replica_backup_id = snapshot['dataset']['snapshot_id']
-                    replica_backup_created = (replica_backup_id is not None)
-
-                    instance_tasks.create_instance(
-                        flavor, image_id, databases, users, datastore_manager,
-                        packages, volume_size, replica_backup_id,
-                        availability_zone, root_passwords[replica_index],
-                        nics, overrides, None, snapshot, volume_type,
-                        modules, scheduler_hints)
-
-                    replicas.append(instance_tasks)
-                except Exception:
-                    # if it's the first replica, then we shouldn't continue
-                    LOG.exception(
-                        "Could not create replica %(num)d of %(count)d.",
-                        {'num': replica_number, 'count': len(ids)})
-                    if replica_number == 1:
-                        raise
+                instance_tasks = FreshInstanceTasks.load(
+                    context, ids[replica_index])
+                instance_tasks.create_instance(
+                    flavor, image_id, databases, users, datastore_manager,
+                    packages, volume_size, replica_backup_id,
+                    availability_zone, root_passwords[replica_index],
+                    nics, overrides, None, snapshot, volume_type,
+                    modules, scheduler_hints, access=access,
+                    ds_version=ds_version)
+                replicas.append(instance_tasks)
 
             for replica in replicas:
                 replica.wait_for_instance(CONF.restore_usage_timeout, flavor)
-
+        except Exception as err:
+            LOG.error('Failed to create replica from %s, error: %s',
+                      slave_of_id, str(err))
+            raise
         finally:
-            if replica_backup_created:
-                Backup.delete(context, replica_backup_id)
+            Backup.delete(context, replica_backup_id)
 
     def _create_instance(self, context, instance_id, name, flavor,
                          image_id, databases, users, datastore_manager,
                          packages, volume_size, backup_id, availability_zone,
                          root_password, nics, overrides, slave_of_id,
                          cluster_config, volume_type, modules, locality,
-                         access=None):
+                         access=None, ds_version=None):
         if slave_of_id:
             self._create_replication_slave(context, instance_id, name,
                                            flavor, image_id, databases, users,
@@ -384,7 +402,9 @@ class Manager(periodic_task.PeriodicTasks):
                                            volume_size,
                                            availability_zone, root_password,
                                            nics, overrides, slave_of_id,
-                                           backup_id, volume_type, modules)
+                                           backup_id, volume_type, modules,
+                                           access=access,
+                                           ds_version=ds_version)
         else:
             if type(instance_id) in [list]:
                 raise AttributeError(_(
@@ -404,7 +424,7 @@ class Manager(periodic_task.PeriodicTasks):
                 availability_zone, root_password,
                 nics, overrides, cluster_config,
                 None, volume_type, modules,
-                scheduler_hints, access=access
+                scheduler_hints, access=access, ds_version=ds_version
             )
 
             timeout = (CONF.restore_usage_timeout if backup_id
@@ -416,24 +436,39 @@ class Manager(periodic_task.PeriodicTasks):
                         packages, volume_size, backup_id, availability_zone,
                         root_password, nics, overrides, slave_of_id,
                         cluster_config, volume_type, modules, locality,
-                        access=None):
-        with EndNotification(context,
-                             instance_id=(instance_id[0]
-                                          if isinstance(instance_id, list)
-                                          else instance_id)):
+                        access=None, ds_version=None):
+        with EndNotification(
+            context,
+            instance_id=(
+                instance_id[0]
+                if isinstance(instance_id, list)
+                else instance_id
+            )
+        ):
             self._create_instance(context, instance_id, name, flavor,
                                   image_id, databases, users,
                                   datastore_manager, packages, volume_size,
                                   backup_id, availability_zone,
                                   root_password, nics, overrides, slave_of_id,
                                   cluster_config, volume_type, modules,
-                                  locality, access=access)
+                                  locality, access=access,
+                                  ds_version=ds_version)
 
     def upgrade(self, context, instance_id, datastore_version_id):
         instance_tasks = models.BuiltInstanceTasks.load(context, instance_id)
         datastore_version = DatastoreVersion.load_by_uuid(datastore_version_id)
         with EndNotification(context):
             instance_tasks.upgrade(datastore_version)
+
+    def update_access(self, context, instance_id, access):
+        instance_tasks = models.BuiltInstanceTasks.load(context, instance_id)
+
+        try:
+            instance_tasks.update_access(access)
+        except Exception as e:
+            LOG.error(f"Failed to update access configuration for "
+                      f"{instance_id}: {str(e)}")
+            self.update_db(task_status=InstanceTasks.UPDATING_ERROR_ACCESS)
 
     def create_cluster(self, context, cluster_id):
         with EndNotification(context, cluster_id=cluster_id):

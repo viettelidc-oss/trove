@@ -13,8 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
-
 from oslo_log import log as logging
 
 from neutronclient.common import exceptions as neutron_exceptions
@@ -24,6 +22,7 @@ from trove.cluster.tasks import ClusterTasks
 from trove.common import cfg
 from trove.common import clients
 from trove.common import exception
+from trove.common import glance as common_glance
 from trove.common.i18n import _
 from trove.common.notification import (
     DBaaSClusterAttachConfiguration,
@@ -262,14 +261,16 @@ class Cluster(object):
 
     @classmethod
     def create(cls, context, name, datastore, datastore_version,
-               instances, extended_properties, locality, configuration):
+               instances, extended_properties, locality, configuration,
+               image_id=None):
         locality = srv_grp.ServerGroup.build_scheduler_hint(
             context, locality, name)
         api_strategy = strategy.load_api_strategy(datastore_version.manager)
         return api_strategy.cluster_class.create(context, name, datastore,
                                                  datastore_version, instances,
                                                  extended_properties,
-                                                 locality, configuration)
+                                                 locality, configuration,
+                                                 image_id)
 
     def validate_cluster_available(self, valid_states=[ClusterTasks.NONE]):
         if self.db_info.task_status not in valid_states:
@@ -324,11 +325,22 @@ class Cluster(object):
                             node['availability_zone'])
                     if 'type' in node:
                         instance_type = node['type']
-                        if isinstance(instance_type, six.string_types):
+                        if isinstance(instance_type, str):
                             instance_type = instance_type.split(',')
                         instance['instance_type'] = instance_type
                     instances.append(instance)
-                return self.grow(instances)
+
+                # Since Victoria, guest agent uses docker.
+                # Get image_id from glance if image_id in datastore_versions
+                # table is NULL.
+                image_id = self.ds_version.image_id
+                if not image_id:
+                    glance_client = clients.create_glance_client(context)
+                    image_id = common_glance.get_image_id(
+                        glance_client, self.ds_version.image_id,
+                        self.ds_version.image_tags)
+                return self.grow(instances, image_id)
+
         elif action == 'shrink':
             context.notification = DBaaSClusterShrink(context, request=req)
             instance_ids = [instance['id'] for instance in param]
@@ -373,7 +385,7 @@ class Cluster(object):
         else:
             raise exception.BadRequest(_("Action %s not supported") % action)
 
-    def grow(self, instances):
+    def grow(self, instances, image_id=None):
         raise exception.BadRequest(_("Action 'grow' not supported"))
 
     def shrink(self, instance_ids):
@@ -663,7 +675,7 @@ def validate_instance_nics(context, instances):
     for instance in instances:
         nics = instance.get('nics')
         if nics:
-            instance_nics.append(nics[0].get('net-id'))
+            instance_nics.append(nics[0].get('network_id'))
     if len(set(instance_nics)) > 1:
         raise exception.ClusterNetworksNotEqual()
     if not instance_nics:

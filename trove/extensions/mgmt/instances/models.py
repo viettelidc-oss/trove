@@ -14,13 +14,14 @@
 import datetime
 
 from oslo_log import log as logging
+from sqlalchemy import desc
 
+from novaclient import api_versions
 from trove.common import cfg
 from trove.common import clients
 from trove.common import exception
-from trove.common.i18n import _
 from trove.common import timeutils
-from trove.extensions.mysql import models as mysql_models
+from trove.extensions.common import models as common_models
 from trove.instance import models as instance_models
 from trove import rpc
 
@@ -28,25 +29,73 @@ LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
 
 
+def _paginate_instances(context, query, model):
+    marker = int(context.marker or 0)
+    limit = int(context.limit or CONF.instances_page_size)
+
+    query = query.order_by(desc(model.updated))
+
+    query = query.limit(limit)
+    query = query.offset(marker)
+
+    if query.count() < limit:
+        next_marker = None
+    else:
+        next_marker = marker + limit
+
+    return query.all(), next_marker
+
+
 def load_mgmt_instances(context, deleted=None, client=None,
-                        include_clustered=None):
+                        include_clustered=None, project_id=None,
+                        paginated=False):
     if not client:
         client = clients.create_nova_client(
             context, CONF.service_credentials.region_name
         )
-    mgmt_servers = client.servers.list(search_opts={'all_tenants': 1})
+
+    with instance_models.DBInstance.query() as query:
+        if deleted is not None:
+            query = query.filter_by(deleted=deleted)
+        if not include_clustered:
+            query = query.filter_by(cluster_id=None)
+        if project_id:
+            query = query.filter_by(tenant_id=project_id)
+
+        if paginated:
+            db_infos, marker = _paginate_instances(
+                context, query, instance_models.DBInstance)
+        else:
+            db_infos = query.all()
+
+    search_opts = {'all_tenants': False}
+    if client.api_version >= api_versions.APIVersion('2.26'):
+        # Utilize nova tags feature
+        server_ids = []
+        if project_id:
+            # Filter by project id tag
+            search_opts['tags'] = f'trove_project_id_{project_id}'
+        else:
+            # cherry-picking only by found db instances ids
+            server_ids = [f'trove_instance_id_{i.id}' for i in db_infos]
+
+        if server_ids:
+            search_opts['tags-any'] = ','.join(server_ids)
+
+        if 'tags' not in search_opts and 'tags-any' not in search_opts:
+            # Fallback: return all trove instances, filtered by tag
+            search_opts['tags'] = 'trove_instance'
+
+    mgmt_servers = client.servers.list(search_opts=search_opts, limit=-1)
     LOG.info("Found %d servers in Nova",
              len(mgmt_servers if mgmt_servers else []))
-    args = {}
-    if deleted is not None:
-        args['deleted'] = deleted
-    if not include_clustered:
-        args['cluster_id'] = None
-    db_infos = instance_models.DBInstance.find_all(**args)
 
     instances = MgmtInstances.load_status_from_existing(context, db_infos,
                                                         mgmt_servers)
-    return instances
+    if paginated:
+        return instances, marker
+    else:
+        return instances
 
 
 def load_mgmt_instance(cls, context, id, include_deleted):
@@ -126,8 +175,8 @@ class DetailedMgmtInstance(SimpleMgmtInstance):
             instance.volume = None
             # Populate the volume_used attribute from the guest agent.
         instance_models.load_guest_info(instance, context, id)
-        instance.root_history = mysql_models.RootHistory.load(context=context,
-                                                              instance_id=id)
+        instance.root_history = common_models.RootHistory.load(context=context,
+                                                               instance_id=id)
         return instance
 
 
@@ -151,11 +200,11 @@ class MgmtInstances(instance_models.Instances):
         def load_instance(context, db, status, server=None):
             return SimpleMgmtInstance(context, db, server, status)
 
-        if context is None:
-            raise TypeError(_("Argument context not defined."))
         find_server = instance_models.create_server_list_matcher(servers)
+
         instances = instance_models.Instances._load_servers_status(
             load_instance, context, db_infos, find_server)
+
         _load_servers(instances, find_server)
         return instances
 
@@ -168,7 +217,7 @@ def _load_servers(instances, find_server):
             server = find_server(db.id, db.compute_instance_id)
             instance.server = server
         except Exception as ex:
-            LOG.exception(ex)
+            LOG.warning(ex)
     return instances
 
 

@@ -23,9 +23,9 @@ import math
 import re
 import time
 
+from http import client as http_client
 from oslo_serialization import jsonutils
 from oslo_utils import importutils
-from six.moves import http_client
 import webob.dec
 import webob.exc
 
@@ -145,6 +145,7 @@ class Limit(object):
             "unit": self.display_unit(),
             "resetTime": int(self.next_request or self._get_time()),
         }
+
 
 # "Limit" format is a dictionary with the HTTP verb, human-readable URI,
 # a regular-expression to match, value and unit of measure (PER_DAY, etc.)

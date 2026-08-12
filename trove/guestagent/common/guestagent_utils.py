@@ -13,13 +13,22 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import collections
+from collections import abc
+import json
 import os
 import re
 
-import six
+from pyroute2 import IPRoute
+from semantic_version import Version
 
+from trove.common import cfg
+from trove.common import constants
+from trove.common import exception
 from trove.common import pagination
+from trove.common import utils
+from trove.guestagent.common import operating_system
+
+CONF = cfg.CONF
 
 
 def update_dict(updates, target):
@@ -43,7 +52,7 @@ def update_dict(updates, target):
 
     if updates is not None:
         for k, v in updates.items():
-            if isinstance(v, collections.Mapping):
+            if isinstance(v, abc.Mapping):
                 target[k] = update_dict(v, target.get(k, {}))
             else:
                 target[k] = updates[k]
@@ -81,7 +90,7 @@ def flatten_dict(target, namespace_sep='.'):
     """
     def flatten(target, keys, namespace_sep):
         flattened = {}
-        if isinstance(target, collections.Mapping):
+        if isinstance(target, abc.Mapping):
             for k, v in target.items():
                 flattened.update(
                     flatten(v, keys + [k], namespace_sep))
@@ -107,8 +116,8 @@ def build_file_path(base_dir, base_name, *extensions):
 def to_bytes(value):
     """Convert numbers with a byte suffix to bytes.
     """
-    if isinstance(value, six.string_types):
-        pattern = re.compile(r'^(\d+)([K,M,G]{1})$')
+    if isinstance(value, str):
+        pattern = re.compile(r'^(\d+)([K,M,G,T]{1})$')
         match = pattern.match(value)
         if match:
             value = match.group(1)
@@ -117,6 +126,7 @@ def to_bytes(value):
                 'K': 1024,
                 'M': 1024 ** 2,
                 'G': 1024 ** 3,
+                'T': 1024 ** 4
             }[suffix]
 
             return int(round(factor * float(value)))
@@ -140,3 +150,65 @@ def serialize_list(li, limit=None, marker=None, include_marker=False):
     page, next_name = paginate_list(li, limit=limit, marker=marker,
                                     include_marker=include_marker)
     return [item.serialize() for item in page], next_name
+
+
+def get_filesystem_volume_stats(fs_path):
+    try:
+        stats = os.statvfs(fs_path)
+    except OSError:
+        raise RuntimeError("Filesystem not found (%s)" % fs_path)
+
+    total = stats.f_blocks * stats.f_bsize
+    free = stats.f_bfree * stats.f_bsize
+    # return the size in GB
+    used_gb = utils.to_gb(total - free)
+    total_gb = utils.to_gb(total)
+
+    output = {
+        'block_size': stats.f_bsize,
+        'total_blocks': stats.f_blocks,
+        'free_blocks': stats.f_bfree,
+        'total': total_gb,
+        'free': free,
+        'used': used_gb
+    }
+    return output
+
+
+def get_conf_dir():
+    """Get the config directory for the database related settings.
+
+    For now, the files inside the config dir are mainly for instance rebuild.
+    """
+    mount_point = CONF.get(CONF.datastore_manager).mount_point
+    conf_dir = os.path.join(mount_point, 'conf.d')
+    if not operating_system.exists(conf_dir, is_directory=True, as_root=True):
+        operating_system.ensure_directory(conf_dir, as_root=True)
+
+    return conf_dir
+
+
+def disable_user_defined_port():
+    with open(constants.ETH1_CONFIG_PATH) as fd:
+        eth1_config = json.load(fd)
+    ipr = IPRoute()
+    ifaces = ipr.get_links(address=eth1_config.get("mac_address"))
+    if not ifaces:
+        return
+    ifname = ifaces[0].get_attr('IFLA_IFNAME')
+    operating_system.execute_shell_cmd(f"ip link set {ifname} down", [],
+                                       shell=True,
+                                       as_root=True)
+
+
+# This helper method allows upgrade only between minor versions e.g. from 16.10
+# to 16.11. Attempt to upgrade from 16.10 to 17.1  will throw a TroveError.
+def prevent_major_version_upgrade(cur_ver, new_ver):
+    current = Version.coerce(str(cur_ver))
+    target = Version.coerce(str(new_ver))
+
+    if current.major != target.major:
+        raise exception.TroveError(
+            "Major version upgrade is not allowed: "
+            "%s -> %s" % (cur_ver, new_ver)
+        )

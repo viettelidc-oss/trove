@@ -1,0 +1,41 @@
+- nodeset:
+    name: trove-ubuntu-noble
+    nodes:
+      - name: controller
+        label: nested-virt-ubuntu-noble
+    groups:
+      - name: tempest
+        nodes:
+          - controller
+
+- nodeset:
+    name: trove-ubuntu-noble-single
+    nodes:
+      - name: primary
+        label: ubuntu-noble
+
+- secret:
+    name: trove_quay_io_creds_2026_jan
+    data:
+      username: !encrypted/pkcs1-oaep
+        - CTVBMlrz4cal7rwge0ZMNKAqX/HyKIuUwByGxH15O5ScHi6NaRXSysbhLlctJsoDnnaqd
+          V6QUgA2LBH23cxSXvz/hnu7jc5Adz/gPA2cSMneLJGj95bSVCFBV5p59x33kdTt9a0pbp
+          QK/RZ34J2BDDrbOk53pax96X+8ddGACx8l3JlomzgrVqbjGE/AiUUK3fzQa/RCqkQb8qT
+          fy7PIOtySi+YXzAWcJf8r7wpovH/Fhufaouo54gEOYCQCWp5w+ZyElNur6yFfGuWVThW4
+          bxUF1/iJ+WmQz0F/QUpvNX9hWyCg/nfx5pb44l7E+zEg4m6/wGvfEAxxB6vjKv1C2ZHUp
+          9H78dNMcYkxZqzsi6G+gI+tkolnb+Hm3UfoSk7xWuLkLu1bEb+G50m/cgIcOjd1j/omWR
+          YzjypO+V6hnA8wsrlk3uXo93TK2LFAJZ6Sitqw5TW9N9pBbr+tyPyJQ0BsEVqYvFYb+Ky
+          Vm2r0A+iV9J1uuyyW6315ZefN1H6TaE5/vwLNq7FTxkYUhsZoRHjssyOinaZ4bTJm4mGn
+          tTy5Vc5Xp4WXDR7f1at2GK2zlAyj3sQhuyMHjvR5EQIyIV8ZKaPMMOpJ8xL8JMhYmVoe6
+          RORfILr6o+gq1n90o526LLdgANFumkg4w8hWENsy0IwKNjOBCCRkfnBWjrMvfQ=
+      password: !encrypted/pkcs1-oaep
+        - RrWT+dvS+v3lg9B/Uc7M1kOK7uEUT65GejrD63OeI1BAf5LnRjHT2S6coyVUhYJ8BxE7l
+          ZPHD2bFqWOU4/959c7kfxOZLumWocfrzRh2ptevVEVzQ1OCD0uZZglSIe2YdVSDUV/QL0
+          JZGiReTPvBlf3rrhPl1DVwQ4kT9QQMeWMdtizWiVls10dTsT71MS6+bS74NSyZzusLFB8
+          ciou3oXN5CbaDFywPvbGu/VUASVjNOJ4v7ABgTkPUO0gHekRQAv9CdF9CBc9xykNA125m
+          SNuDhzcAMGGXvnzS7yeuc1VrTYOQWbrEYPDD1kTpo7KOB0Jw8QwruR9Oi1yVHA8g6ZJYV
+          0gnkNDd79cgNEA/OSomDHssl9mM0ZObeA0eZZQ2Fx9dFku2COeLg2ohcOsXyAoDfJXhnU
+          rmWrMVonAsvfmbCTm2al54zgQ2y9Hjp6pVjZTt8MnJBdywCfxEYJQqgeH8Scj1305JPF0
+          mW7/pIuAlbPpHpJuv5q3jYB9C5lHrZR2+HkumxbgNOotEflDjITi6RthU/O2zaoDVxId7
+          CXcwOdBnldDG690JGhOcX6MTVTHM4WnkfBy2rPaPVZN4/E+KjKxZZmYnaJL8T5z0vQUoU
+          mrA16MtIwL7c1qu+0UjFg2ny0qO/SHbGNnpkd4EnNKl7V5yqm/Rq5m0lBcVuKE=

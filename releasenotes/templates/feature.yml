@@ -1,0 +1,7 @@
+---
+features:
+  - |
+    Implements [some feature].
+    [Can be described using multiple sentences if necessary.]
+    [Limitations worth mentioning can be included as well.]
+    `LP#[bug number] <https://bugs.launchpad.net/trove/[bug number]>`__

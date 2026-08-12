@@ -12,6 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from contextlib import contextmanager
+
 from oslo_log import log as logging
 from oslo_utils import strutils
 
@@ -53,8 +55,11 @@ class DatabaseModelBase(models.ModelBase):
         return hasattr(self, 'deleted') and hasattr(self, 'deleted_at')
 
     @classmethod
+    @contextmanager
     def query(cls):
-        return get_db_api()._base_query(cls)
+        query = get_db_api()._base_query(cls)
+        yield query
+        query.session.commit()
 
     def save(self):
         if not self.is_valid():
@@ -129,6 +134,18 @@ class DatabaseModelBase(models.ModelBase):
     @classmethod
     def find_all(cls, **kwargs):
         return db_query.find_all(cls, **cls._process_conditions(kwargs))
+
+    @classmethod
+    def find_first(cls, filters=None, **conditions):
+        with cls.query() as q:
+            for field, value in conditions.items():
+                q = q.filter(getattr(cls, field) == value)
+
+            if filters:
+                for f in filters:
+                    q = q.filter(f)
+
+            return q.first()
 
     @classmethod
     def _process_conditions(cls, raw_conditions):

@@ -1,11 +1,13 @@
 {
     "configuration": {
+        "name": "group1",
         "datastore": {
-                "type": "mysql"
+            "type": "mysql",
+            "version": "mysql-5.7",
+            "version_number": "5.7.29"
         },
         "values": {
-                "sync_binlog": 1
-        },
-        "name": "group1"
+            "connect_timeout": 200
+        }
     }
 }

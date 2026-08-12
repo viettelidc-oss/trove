@@ -17,7 +17,6 @@
 """Model classes that form the core of Module functionality."""
 
 import hashlib
-import six
 from sqlalchemy.sql.expression import or_
 
 from oslo_log import log as logging
@@ -64,14 +63,16 @@ class Modules(object):
             # build a query manually, since we need current tenant
             # plus the 'all' tenant ones
             query_opts['visible'] = True
-            db_info = DBModule.query().filter_by(**query_opts)
-            db_info = db_info.filter(
-                or_(DBModule.tenant_id == context.project_id,
-                    DBModule.tenant_id.is_(None))
-            )
-            if db_info.count() == 0:
-                LOG.debug("No modules found for tenant %s", context.project_id)
-        modules = db_info.all()
+            with DBModule.query() as query:
+                db_info = query.filter_by(**query_opts)
+                db_info = db_info.filter(
+                    or_(DBModule.tenant_id == context.project_id,
+                        DBModule.tenant_id.is_(None))
+                )
+                if db_info.count() == 0:
+                    LOG.debug("No modules found for tenant %s",
+                              context.project_id)
+                modules = db_info.all()
         return modules
 
     @staticmethod
@@ -84,14 +85,16 @@ class Modules(object):
 
         query_opts = {'deleted': False,
                       'auto_apply': True}
-        db_info = DBModule.query().filter_by(**query_opts)
-        db_info = Modules.add_tenant_filter(db_info, context.project_id)
-        db_info = Modules.add_datastore_filter(db_info, datastore_id)
-        db_info = Modules.add_ds_version_filter(db_info, datastore_version_id)
-        if db_info.count() == 0:
-            LOG.debug("No auto-apply modules found for tenant %s",
-                      context.project_id)
-        modules = db_info.all()
+        with DBModule.query() as query:
+            db_info = query.filter_by(**query_opts)
+            db_info = Modules.add_tenant_filter(db_info, context.project_id)
+            db_info = Modules.add_datastore_filter(db_info, datastore_id)
+            db_info = Modules.add_ds_version_filter(db_info,
+                                                    datastore_version_id)
+            if db_info.count() == 0:
+                LOG.debug("No auto-apply modules found for tenant %s",
+                          context.project_id)
+            modules = db_info.all()
         return modules
 
     @staticmethod
@@ -123,12 +126,13 @@ class Modules(object):
         modules = []
         if module_ids:
             query_opts = {'deleted': False}
-            db_info = DBModule.query().filter_by(**query_opts)
-            if not context.is_admin:
-                db_info = Modules.add_tenant_filter(db_info,
-                                                    context.project_id)
-            db_info = db_info.filter(DBModule.id.in_(module_ids))
-            modules = db_info.all()
+            with DBModule.query() as query:
+                db_info = query.filter_by(**query_opts)
+                if not context.is_admin:
+                    db_info = Modules.add_tenant_filter(db_info,
+                                                        context.project_id)
+                db_info = db_info.filter(DBModule.id.in_(module_ids))
+                modules = db_info.all()
         return modules
 
     @staticmethod
@@ -246,10 +250,9 @@ class Module(object):
     # be stored in a text field in the Trove database.
     @staticmethod
     def process_contents(contents):
-        md5 = contents
-        if isinstance(md5, six.text_type):
-            md5 = md5.encode('utf-8')
-        md5 = hashlib.md5(md5).hexdigest()
+        if isinstance(contents, str):
+            contents = contents.encode('utf-8')
+        md5 = hashlib.md5(contents, usedforsecurity=False).hexdigest()
         encrypted_contents = crypto_utils.encrypt_data(
             contents, Modules.ENCRYPT_KEY)
         return md5, crypto_utils.encode_data(encrypted_contents)

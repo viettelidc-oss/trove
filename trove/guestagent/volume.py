@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import abc
 import os
 import shlex
 from tempfile import NamedTemporaryFile
@@ -49,10 +50,156 @@ def log_and_raise(log_fmt, exc_fmt, fmt_content=None):
     raise exception.GuestError(original_message=raise_msg)
 
 
+class FSBase(object, metaclass=abc.ABCMeta):
+
+    def __init__(self, fstype, format_options):
+        self.fstype = fstype
+        self.format_options = format_options
+
+    @abc.abstractmethod
+    def format(self, device_path, timeout):
+        """
+        Format device
+        """
+
+    @abc.abstractmethod
+    def check_format(self, device_path):
+        """
+        Check if device is formatted
+        """
+
+    @abc.abstractmethod
+    def resize(self, device_path, online=False):
+        """
+        Resize the filesystem on device
+        """
+
+
+class FSExt(FSBase):
+
+    def __init__(self, fstype, format_options):
+        super(FSExt, self).__init__(fstype, format_options)
+
+    def format(self, device_path, timeout):
+        format_options = shlex.split(self.format_options)
+        format_options.append(device_path)
+        try:
+            utils.execute_with_timeout(
+                "mkfs", "--type", self.fstype, *format_options,
+                timeout=timeout, run_as_root=True, root_helper="sudo")
+        except exception.ProcessExecutionError:
+            log_fmt = "Could not format '%s'."
+            exc_fmt = _("Could not format '%s'.")
+            log_and_raise(log_fmt, exc_fmt, device_path)
+
+    def check_format(self, device_path):
+        try:
+            stdout, stderr = utils.execute(
+                "blkid", "-o", "value", "-s", "TYPE",
+                device_path, run_as_root=True, root_helper="sudo")
+        except exception.ProcessExecutionError as pe:
+            # blkid exit code 2 means no filesystem signature found
+            if pe.exit_code == 2:
+                msg = _("Volume '%s' does not appear to be formatted.") % (
+                    device_path)
+                raise exception.GuestError(original_message=msg)
+
+            LOG.exception(
+                "Failed to check filesystem on '%s': %s",
+                device_path,
+                pe.stderr)
+            raise
+
+        # Attempt automatic repair of recoverable filesystem issues.
+        try:
+            utils.execute(
+                "e2fsck", "-p", device_path, run_as_root=True,
+                root_helper="sudo")
+        except exception.ProcessExecutionError as pe:
+            # Exit code 1 means filesystem errors corrected
+            # Exit code 2 means system should be rebooted. Safe here because
+            # filesystem is not yet mounted for service workload.
+            # Exit code 3 means both 1 and 2
+            if pe.exit_code in (1, 2, 3):
+                LOG.warning(
+                    "Filesystem issues detected and repaired on '%s': %s",
+                    device_path,
+                    pe.stderr)
+            else:
+                raise
+
+    def resize(self, device_path, online=False):
+        if not online:
+            utils.execute("e2fsck", "-f", "-p", device_path,
+                          run_as_root=True, root_helper="sudo")
+        utils.execute("resize2fs", device_path,
+                      run_as_root=True, root_helper="sudo")
+
+
+class FSExt3(FSExt):
+
+    def __init__(self, format_options):
+        super(FSExt3, self).__init__('ext3', format_options)
+
+
+class FSExt4(FSExt):
+
+    def __init__(self, format_options):
+        super(FSExt4, self).__init__('ext4', format_options)
+
+
+class FSXFS(FSBase):
+
+    def __init__(self, format_options):
+        super(FSXFS, self).__init__('xfs', format_options)
+
+    def format(self, device_path, timeout):
+        format_options = shlex.split(self.format_options)
+        format_options.append(device_path)
+        try:
+            utils.execute_with_timeout(
+                "mkfs.xfs", *format_options,
+                timeout=timeout, run_as_root=True, root_helper="sudo")
+        except exception.ProcessExecutionError:
+            log_fmt = "Could not format '%s'."
+            exc_fmt = _("Could not format '%s'.")
+            log_and_raise(log_fmt, exc_fmt, device_path)
+
+    def check_format(self, device_path):
+        stdout, stderr = utils.execute(
+            "xfs_admin", "-l", device_path,
+            run_as_root=True, root_helper="sudo")
+        if 'not a valid XFS filesystem' in stdout:
+            msg = _("Volume '%s' does not appear to be formatted.") % (
+                device_path)
+            raise exception.GuestError(original_message=msg)
+
+    def resize(self, device_path, online=False):
+        utils.execute("xfs_repair", device_path,
+                      run_as_root=True, root_helper="sudo")
+        utils.execute("mount", device_path,
+                      run_as_root=True, root_helper="sudo")
+        utils.execute("xfs_growfs", device_path,
+                      run_as_root=True, root_helper="sudo")
+        utils.execute("umount", device_path,
+                      run_as_root=True, root_helper="sudo")
+
+
+def VolumeFs(fstype, format_options=''):
+    supported_fs = {
+        'xfs': FSXFS,
+        'ext3': FSExt3,
+        'ext4': FSExt4
+    }
+    return supported_fs[fstype](format_options)
+
+
 class VolumeDevice(object):
 
     def __init__(self, device_path):
         self.device_path = device_path
+        self.volume_fs = VolumeFs(CONF.volume_fstype,
+                                  CONF.format_options)
 
     def migrate_data(self, source_dir, target_subdir=None):
         """Synchronize the data from the source directory to the new
@@ -97,47 +244,24 @@ class VolumeDevice(object):
     def _check_format(self):
         """Checks that a volume is formatted."""
         LOG.debug("Checking whether '%s' is formatted.", self.device_path)
-        try:
-            stdout, stderr = utils.execute(
-                "dumpe2fs", self.device_path,
-                run_as_root=True, root_helper="sudo")
-            if 'has_journal' not in stdout:
-                msg = _("Volume '%s' does not appear to be formatted.") % (
-                    self.device_path)
-                raise exception.GuestError(original_message=msg)
-        except exception.ProcessExecutionError as pe:
-            if 'Wrong magic number' in pe.stderr:
-                volume_fstype = CONF.volume_fstype
-                log_fmt = "'Device '%(dev)s' did not seem to be '%(type)s'."
-                exc_fmt = _("'Device '%(dev)s' did not seem to be '%(type)s'.")
-                log_and_raise(log_fmt, exc_fmt, {'dev': self.device_path,
-                                                 'type': volume_fstype})
-            log_fmt = "Volume '%s' was not formatted."
-            exc_fmt = _("Volume '%s' was not formatted.")
-            log_and_raise(log_fmt, exc_fmt, self.device_path)
+        self.volume_fs.check_format(self.device_path)
 
     def _format(self):
         """Calls mkfs to format the device at device_path."""
-        volume_fstype = CONF.volume_fstype
-        format_options = shlex.split(CONF.format_options)
-        format_options.append(self.device_path)
-        volume_format_timeout = CONF.volume_format_timeout
         LOG.debug("Formatting '%s'.", self.device_path)
-        try:
-            utils.execute_with_timeout(
-                "mkfs", "--type", volume_fstype, *format_options,
-                run_as_root=True, root_helper="sudo",
-                timeout=volume_format_timeout)
-        except exception.ProcessExecutionError:
-            log_fmt = "Could not format '%s'."
-            exc_fmt = _("Could not format '%s'.")
-            log_and_raise(log_fmt, exc_fmt, self.device_path)
+        self.volume_fs.format(self.device_path, CONF.volume_format_timeout)
 
     def format(self):
         """Formats the device at device_path and checks the filesystem."""
         self._check_device_exists()
-        self._format()
-        self._check_format()
+
+        try:
+            self._check_format()
+            LOG.debug(f"Device {self.device_path} already formatted.")
+            return
+        except exception.GuestError:
+            self._format()
+            self._check_format()
 
     def mount(self, mount_point, write_to_fstab=True):
         """Mounts, and writes to fstab."""
@@ -161,21 +285,18 @@ class VolumeDevice(object):
 
         return True
 
-    def resize_fs(self, mount_point):
+    def resize_fs(self, mount_point, online=False):
         """Resize the filesystem on the specified device."""
         self._check_device_exists()
         # Some OS's will mount a file systems after it's attached if
         # an entry is put in the fstab file (like Trove does).
         # Thus it may be necessary to wait for the mount and then unmount
         # the fs again (since the volume was just attached).
-        if self._wait_for_mount(mount_point, timeout=2):
+        if not online and self._wait_for_mount(mount_point, timeout=2):
             LOG.debug("Unmounting '%s' before resizing.", mount_point)
             self.unmount(mount_point)
         try:
-            utils.execute("e2fsck", "-f", "-p", self.device_path,
-                          run_as_root=True, root_helper="sudo")
-            utils.execute("resize2fs", self.device_path,
-                          run_as_root=True, root_helper="sudo")
+            self.volume_fs.resize(self.device_path, online=online)
         except exception.ProcessExecutionError:
             log_fmt = "Error resizing the filesystem with device '%s'."
             exc_fmt = _("Error resizing the filesystem with device '%s'.")
@@ -236,11 +357,11 @@ class VolumeMountPoint(object):
     def mount(self):
         if not operating_system.exists(self.mount_point, is_directory=True,
                                        as_root=True):
-            operating_system.create_directory(self.mount_point, as_root=True)
-        LOG.debug("Mounting volume. Device path:{0}, mount_point:{1}, "
-                  "volume_type:{2}, mount options:{3}".format(
-                      self.device_path, self.mount_point, self.volume_fstype,
-                      self.mount_options))
+            operating_system.ensure_directory(self.mount_point, as_root=True)
+        LOG.debug("Mounting volume. Device path:%s, mount_point:%s, "
+                  "volume_type:%s, mount options:%s",
+                  self.device_path, self.mount_point, self.volume_fstype,
+                  self.mount_options)
         try:
             utils.execute("mount", "-t", self.volume_fstype,
                           "-o", self.mount_options,

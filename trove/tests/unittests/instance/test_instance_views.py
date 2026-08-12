@@ -13,11 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
-from mock import Mock
 from trove.common import cfg
 from trove.instance.views import InstanceDetailView
 from trove.instance.views import InstanceView
 from trove.tests.unittests import trove_testtools
+from unittest.mock import MagicMock
+from unittest.mock import Mock
 
 CONF = cfg.CONF
 
@@ -26,15 +27,20 @@ class InstanceViewsTest(trove_testtools.TestCase):
 
     def setUp(self):
         super(InstanceViewsTest, self).setUp()
-        self.addresses = {"private": [{"addr": "123.123.123.123"}],
-                          "internal": [{"addr": "10.123.123.123"}],
-                          "public": [{"addr": "15.123.123.123"}]}
-        self.orig_label_regex = CONF.network_label_regex
+        self.addresses = [{
+            'type': 'private',
+            'address': '123.123.123.123',
+            'network': 'net-id-private'}, {
+            'type': 'private',
+            'address': '10.123.123.123',
+            'network': 'net-id-private'}, {
+            'type': 'public',
+            'address': '15.123.123.123',
+            'network': 'net-id-public'}]
         self.orig_ip_regex = CONF.ip_regex
 
     def tearDown(self):
         super(InstanceViewsTest, self).tearDown()
-        CONF.network_label_regex = self.orig_label_regex
         CONF.ip_regex = self.orig_ip_regex
 
 
@@ -43,10 +49,8 @@ class InstanceDetailViewTest(trove_testtools.TestCase):
     def setUp(self):
         super(InstanceDetailViewTest, self).setUp()
         self.build_links_method = InstanceView._build_links
-        self.build_flavor_links_method = InstanceView._build_flavor_links
         self.build_config_method = InstanceDetailView._build_configuration_info
         InstanceView._build_links = Mock()
-        InstanceView._build_flavor_links = Mock()
         InstanceDetailView._build_configuration_info = Mock()
         self.instance = Mock()
         self.instance.created = 'Yesterday'
@@ -56,10 +60,12 @@ class InstanceDetailViewTest(trove_testtools.TestCase):
         self.instance.datastore_version.manager = 'mysql'
         self.instance.hostname = 'test.trove.com'
         self.ip = "1.2.3.4"
-        self.instance.addresses = {"private": [{"addr": self.ip}]}
+        self.instance.addresses = [
+            {"address": self.ip, 'type': 'private', 'network': 'net-id'}]
         self.instance.volume_used = '3'
         self.instance.root_password = 'iloveyou'
-        self.instance.get_visible_ip_addresses = lambda: ["1.2.3.4"]
+        self.instance.get_visible_ip_addresses.return_value = [
+            {'type': 'private', 'address': '1.2.3.4', 'network': 'net-id'}]
         self.instance.slave_of_id = None
         self.instance.slaves = []
         self.instance.locality = 'affinity'
@@ -80,7 +86,6 @@ class InstanceDetailViewTest(trove_testtools.TestCase):
     def tearDown(self):
         super(InstanceDetailViewTest, self).tearDown()
         InstanceView._build_links = self.build_links_method
-        InstanceView._build_flavor_links = self.build_flavor_links_method
         InstanceDetailView._build_configuration_info = self.build_config_method
 
     def test_data_hostname(self):
@@ -104,6 +109,8 @@ class InstanceDetailViewTest(trove_testtools.TestCase):
                          result['instance']['datastore']['version'])
         self.assertNotIn('hostname', result['instance'])
         self.assertEqual([self.ip], result['instance']['ip'])
+        self.assertEqual(self.ip,
+                         result['instance']['addresses'][0]['address'])
 
     def test_locality(self):
         self.instance.hostname = None
@@ -135,3 +142,27 @@ class InstanceDetailViewTest(trove_testtools.TestCase):
         result = view.data()
         self.assertNotIn('server_id', result['instance'])
         self.assertNotIn('volume_id', result['instance'])
+
+    def test_access(self):
+        instance = MagicMock()
+        instance.hostname = None
+        instance.get_visible_ip_addresses.return_value = [
+            {'address': '10.111.0.27', 'type': 'private', 'network': 'net-id'}
+        ]
+        instance.access = None
+        instance.slaves = []
+
+        view = InstanceDetailView(instance, self.req)
+        data = view.data()['instance']
+
+        self.assertFalse(data['access']['is_public'])
+
+        instance.get_visible_ip_addresses.return_value = [
+            {'address': '10.111.0.27', 'type': 'private', 'network': 'net-id'},
+            {'address': '172.30.5.107', 'type': 'public', 'network': 'net-id'}
+        ]
+
+        view = InstanceDetailView(instance, self.req)
+        data = view.data()['instance']
+
+        self.assertTrue(data['access']['is_public'])

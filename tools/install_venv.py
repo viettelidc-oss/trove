@@ -22,8 +22,6 @@
 Installation script for Trove's development virtualenv
 """
 
-from __future__ import print_function
-
 import os
 import subprocess
 import sys
@@ -39,11 +37,6 @@ PY_VERSION = "python%s.%s" % (sys.version_info[0], sys.version_info[1])
 def die(message, *args):
     print(message % args, file=sys.stderr)
     sys.exit(1)
-
-
-def check_python_version():
-    if sys.version_info < (2, 7):
-        die("Need Python Version >= 2.7")
 
 
 def run_command(cmd, redirect_output=True, check_exit_code=True):
@@ -139,7 +132,6 @@ def print_help():
 
 
 def main(argv):
-    check_python_version()
     check_dependencies()
     create_virtualenv()
     install_dependencies()

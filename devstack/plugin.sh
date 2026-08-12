@@ -69,17 +69,10 @@ function create_trove_accounts {
             "database" "Trove Service")
         get_or_create_endpoint $trove_service \
             "$REGION_NAME" \
-            "http://$SERVICE_HOST:8779/v1.0/\$(tenant_id)s" \
-            "http://$SERVICE_HOST:8779/v1.0/\$(tenant_id)s" \
-            "http://$SERVICE_HOST:8779/v1.0/\$(tenant_id)s"
+            "${SERVICE_PROTOCOL}://${SERVICE_HOST}/database/v1.0/\$(tenant_id)s" \
+            "${SERVICE_PROTOCOL}://${SERVICE_HOST}/database/v1.0/\$(tenant_id)s" \
+            "${SERVICE_PROTOCOL}://${SERVICE_HOST}/database/v1.0/\$(tenant_id)s"
     fi
-}
-
-# Removes all the WSGI related files and restart apache.
-function cleanup_trove_apache_wsgi {
-    sudo rm -rf $TROVE_WSGI_DIR
-    sudo rm -f $(apache_site_config_for trove-api)
-    restart_apache_server
 }
 
 # stack.sh entry points
@@ -91,13 +84,16 @@ function cleanup_trove {
     # Clean up dirs
     rm -fr $TROVE_CONF_DIR/*
 
+    remove_uwsgi_config "$TROVE_UWSGI_CONF" "trove"
+
     if is_service_enabled horizon; then
         cleanup_trove_dashboard
     fi
 
-    if [[ "${TROVE_USE_MOD_WSGI}" == "TRUE" ]]; then
-        echo "Cleaning up Trove's WSGI setup"
-        cleanup_trove_apache_wsgi
+    if [ "$TROVE_ENABLE_LOCAL_REGISTRY" == "True" ] ; then
+        # Remove registry container but keep existing images.
+        sudo docker stop registry
+        sudo docker rm registry
     fi
 }
 
@@ -164,24 +160,60 @@ function configure_nova_kvm {
     echo "configure_nova_kvm: using virt_type: ${virt_type} for cpu: ${cpu}."
 }
 
-# Setup WSGI config files for Trove and enable the site
-function config_trove_apache_wsgi {
-    local trove_apache_conf
+function configure_docker_images {
+    iniset $TROVE_GUESTAGENT_CONF mysql docker_image ${TROVE_DATABASE_IMAGE_MYSQL}
+    iniset $TROVE_GUESTAGENT_CONF mysql backup_docker_image ${TROVE_DATABASE_BACKUP_IMAGE_MYSQL}
+    iniset $TROVE_GUESTAGENT_CONF mariadb docker_image ${TROVE_DATABASE_IMAGE_MARIADB}
+    iniset $TROVE_GUESTAGENT_CONF mariadb backup_docker_image ${TROVE_DATABASE_BACKUP_IMAGE_MARIADB}
+    iniset $TROVE_GUESTAGENT_CONF postgresql docker_image ${TROVE_DATABASE_IMAGE_POSTGRESQL}
+    iniset $TROVE_GUESTAGENT_CONF postgresql backup_docker_image ${TROVE_DATABASE_BACKUP_IMAGE_POSTGRESQL}
+}
 
-    sudo mkdir -p ${TROVE_WSGI_DIR}
-    sudo cp $TROVE_DIR/trove/cmd/app.wsgi $TROVE_WSGI_DIR/app.wsgi
-    trove_apache_conf=$(apache_site_config_for trove-api)
-    sudo cp $TROVE_DEVSTACK_FILES/apache-trove-api.template ${trove_apache_conf}
-    sudo sed -e "
-        s|%TROVE_SERVICE_PORT%|${TROVE_SERVICE_PORT}|g;
-        s|%TROVE_WSGI_DIR%|${TROVE_WSGI_DIR}|g;
-        s|%USER%|${STACK_USER}|g;
-        s|%APACHE_NAME%|${APACHE_NAME}|g;
-        s|%APIWORKERS%|${API_WORKERS}|g;
-    " -i ${trove_apache_conf}
-    enable_apache_site trove-api
-    tail_log trove-access /var/log/${APACHE_NAME}/trove-api-access.log
-    tail_log trove-api /var/log/${APACHE_NAME}/trove-api.log
+function configure_cloudinit {
+    ETC_HOSTS_APPEND=""
+    local MGMT_PORT_IP="$1"
+    if [[ -n $MGMT_PORT_IP ]]; then
+        # NOTE(mangust404): For proper operation (e.g. Swift) with network
+        # isolation enabled, services running inside Docker containers in the
+        # compute instance should use hostnames instead of IP addresses.
+        # Therefore Swift and Keystone endpoints must also be configured with
+        # hostnames.
+        #
+        # With manage_etc_hosts: "localhost" and the hosts definition below,
+        # cloud-init first writes /etc/hosts and then adds localhost entries
+        # mapped to 127.0.1.1.
+        ETC_HOSTS_APPEND=$(cat <<EOF
+  - path: /etc/hosts
+    content: |
+
+      $MGMT_PORT_IP $LOCAL_HOSTNAME
+
+EOF
+        )
+    fi
+
+    # 1. To avoid 'Connection timed out' error of sudo command inside the guest agent
+    # 2. Config the controller IP address used by guest-agent to download Trove code during initialization (only valid for dev_mode=true).
+    common_cloudinit=/etc/trove/cloudinit/common.cloudinit
+    sudo mkdir -p $(dirname ${common_cloudinit})
+    sudo touch ${common_cloudinit}
+    sudo tee ${common_cloudinit} >/dev/null <<EOF
+#cloud-config
+manage_etc_hosts: "localhost"
+write_files:
+  - path: /etc/trove/controller.conf
+    content: |
+      TROVE_MGMT_GATEWAY=${TROVE_MGMT_GATEWAY}
+      CONTROLLER=${SERVICE_HOST}
+      DB_BACKUP_IMAGE=${TROVE_BUILD_BACKUP_IMAGES}
+${ETC_HOSTS_APPEND}
+EOF
+
+    # NOTE(lxkong): Remove this when we support common cloud-init file for all datastores.
+    for datastore in "mysql" "mariadb" "postgresql"
+    do
+        sudo cp ${common_cloudinit} /etc/trove/cloudinit/${datastore}.cloudinit
+    done
 }
 
 # configure_trove() - Set config files, create data dirs, etc
@@ -197,15 +229,10 @@ function configure_trove {
     sudo install -d -o $STACK_USER ${TROVE_CONF_DIR}
     # Copy api-paste file over to the trove conf dir
     cp $TROVE_LOCAL_API_PASTE_INI $TROVE_API_PASTE_INI
-    # configure apache related files
-    if [[ "${TROVE_USE_MOD_WSGI}" == "TRUE" ]]; then
-        echo "Configuring Trove to use mod-wsgi and Apache"
-        config_trove_apache_wsgi
-    fi
     # (Re)create trove conf files
     rm -f $TROVE_CONF $TROVE_GUESTAGENT_CONF
 
-    TROVE_AUTH_ENDPOINT=$KEYSTONE_AUTH_URI/v$IDENTITY_API_VERSION
+    TROVE_AUTH_ENDPOINT=$KEYSTONE_AUTH_URI
 
     ################################################################ trove conf
     setup_trove_logging $TROVE_CONF
@@ -218,24 +245,25 @@ function configure_trove {
     iniset_conditional $TROVE_CONF DEFAULT usage_timeout $TROVE_USAGE_TIMEOUT
     iniset_conditional $TROVE_CONF DEFAULT state_change_wait_time $TROVE_STATE_CHANGE_WAIT_TIME
     iniset_conditional $TROVE_CONF DEFAULT reboot_time_out 300
+    iniset $TROVE_CONF DEFAULT controller_address ${SERVICE_HOST}
 
     configure_keystone_authtoken_middleware $TROVE_CONF trove
-    iniset $TROVE_CONF service_credentials username trove
-    iniset $TROVE_CONF service_credentials user_domain_name Default
-    iniset $TROVE_CONF service_credentials project_domain_name Default
-    iniset $TROVE_CONF service_credentials password $SERVICE_PASSWORD
-    iniset $TROVE_CONF service_credentials project_name $SERVICE_PROJECT_NAME
+    configure_keystoneauth $TROVE_CONF trove service_credentials
     iniset $TROVE_CONF service_credentials region_name $REGION_NAME
-    iniset $TROVE_CONF service_credentials auth_url $TROVE_AUTH_ENDPOINT
 
     iniset $TROVE_CONF database connection `database_connection_url trove`
 
-    iniset $TROVE_CONF DEFAULT rpc_backend "rabbit"
     iniset $TROVE_CONF DEFAULT control_exchange trove
-    iniset $TROVE_CONF DEFAULT transport_url rabbit://$RABBIT_USERID:$RABBIT_PASSWORD@$RABBIT_HOST:5672/
-    iniset $TROVE_CONF DEFAULT trove_api_workers "$API_WORKERS"
+    iniset $TROVE_CONF DEFAULT transport_url rabbit://$RABBIT_USERID:$RABBIT_PASSWORD@$RABBIT_HOST:$AMQP_PORT/
     iniset $TROVE_CONF DEFAULT taskmanager_manager trove.taskmanager.manager.Manager
-    iniset $TROVE_CONF DEFAULT default_datastore $TROVE_DATASTORE_TYPE
+    if [[ -n "$TROVE_DATASTORE_TYPE" ]]; then
+        iniset $TROVE_CONF DEFAULT default_datastore $TROVE_DATASTORE_TYPE
+    fi
+
+    iniset $TROVE_CONF cache enabled true
+    iniset $TROVE_CONF cache backend dogpile.cache.memory
+    # Ports caching will produce "Failed to get instance IP address" errors
+    iniset $TROVE_CONF instance_ports_cache caching false
 
     iniset $TROVE_CONF cassandra tcp_ports 7000,7001,7199,9042,9160
     iniset $TROVE_CONF couchbase tcp_ports 8091,8092,4369,11209-11211,21100-21199
@@ -250,45 +278,23 @@ function configure_trove {
     iniset $TROVE_CONF redis tcp_ports 6379,16379
     iniset $TROVE_CONF vertica tcp_ports 5433,5434,5444,5450,4803
 
+    write_uwsgi_config "$TROVE_UWSGI_CONF" "$TROVE_UWSGI" "/database" "" "trove"
+
     ################################################################ trove guest agent conf
     setup_trove_logging $TROVE_GUESTAGENT_CONF
 
     iniset_conditional $TROVE_GUESTAGENT_CONF DEFAULT state_change_wait_time $TROVE_STATE_CHANGE_WAIT_TIME
     iniset_conditional $TROVE_GUESTAGENT_CONF DEFAULT command_process_timeout $TROVE_COMMAND_PROCESS_TIMEOUT
-    iniset $TROVE_GUESTAGENT_CONF DEFAULT rpc_backend "rabbit"
-    iniset $TROVE_GUESTAGENT_CONF DEFAULT transport_url rabbit://$RABBIT_USERID:$RABBIT_PASSWORD@$TROVE_HOST_GATEWAY:5672/
+    iniset $TROVE_GUESTAGENT_CONF DEFAULT transport_url rabbit://$RABBIT_USERID:$RABBIT_PASSWORD@$TROVE_HOST_GATEWAY:$AMQP_PORT/
     iniset $TROVE_GUESTAGENT_CONF DEFAULT control_exchange trove
     iniset $TROVE_GUESTAGENT_CONF DEFAULT ignore_users os_admin
     iniset $TROVE_GUESTAGENT_CONF DEFAULT log_dir /var/log/trove/
     iniset $TROVE_GUESTAGENT_CONF DEFAULT log_file trove-guestagent.log
+    iniset $TROVE_GUESTAGENT_CONF DEFAULT swift_api_insecure true
 
-    iniset $TROVE_GUESTAGENT_CONF service_credentials username trove
-    iniset $TROVE_GUESTAGENT_CONF service_credentials user_domain_name Default
-    iniset $TROVE_GUESTAGENT_CONF service_credentials project_domain_name Default
-    iniset $TROVE_GUESTAGENT_CONF service_credentials password $SERVICE_PASSWORD
-    iniset $TROVE_GUESTAGENT_CONF service_credentials project_name $SERVICE_PROJECT_NAME
-    iniset $TROVE_GUESTAGENT_CONF service_credentials region_name $REGION_NAME
-    iniset $TROVE_GUESTAGENT_CONF service_credentials auth_url $TROVE_AUTH_ENDPOINT
+    configure_docker_images
 
-    # 1. To avoid 'Connection timed out' error of sudo command inside the guest agent
-    # 2. Config the controller IP address used by guest-agent to download Trove code during initialization (only valid for dev_mode=true).
-    common_cloudinit=/etc/trove/cloudinit/common.cloudinit
-    sudo mkdir -p $(dirname ${common_cloudinit})
-    sudo touch ${common_cloudinit}
-    sudo tee ${common_cloudinit} >/dev/null <<EOF
-#cloud-config
-manage_etc_hosts: "localhost"
-write_files:
-  - path: /etc/trove/controller.conf
-    content: |
-      CONTROLLER=${SERVICE_HOST}
-EOF
-
-    # NOTE(lxkong): Remove this when we support common cloud-init file for all datastores.
-    for datastore in "mysql" "mariadb" "postgresql"
-    do
-        sudo cp ${common_cloudinit} /etc/trove/cloudinit/${datastore}.cloudinit
-    done
+    configure_cloudinit
 }
 
 # install_trove() - Collect source and prepare
@@ -300,11 +306,6 @@ function install_trove {
 
     setup_develop $TROVE_DIR
 
-    if [[ "${TROVE_USE_MOD_WSGI}" == "TRUE" ]]; then
-        echo "Installing apache wsgi"
-        install_apache_wsgi
-    fi
-
     if is_service_enabled horizon; then
         install_trove_dashboard
     fi
@@ -315,16 +316,17 @@ function install_trove {
 
 # install_trove_dashboard() - Collect source and prepare
 function install_trove_dashboard {
-    git_clone $TROVE_DASHBOARD_REPO $TROVE_DASHBOARD_DIR $TROVE_DASHBOARD_BRANCH
-    setup_develop $TROVE_DASHBOARD_DIR
+    git_clone_by_name "trove-dashboard"
+    setup_dev_lib "trove-dashboard"
+
     cp $TROVE_DASHBOARD_DIR/trove_dashboard/enabled/_17*database*.py $HORIZON_DIR/openstack_dashboard/local/enabled
 }
 
 # install_python_troveclient() - Collect source and prepare
 function install_python_troveclient {
     if use_library_from_git "python-troveclient"; then
-        git_clone $TROVE_CLIENT_REPO $TROVE_CLIENT_DIR $TROVE_CLIENT_BRANCH
-        setup_develop $TROVE_CLIENT_DIR
+        git_clone_by_name "python-troveclient"
+        setup_dev_lib "python-troveclient"
     fi
 }
 
@@ -341,8 +343,9 @@ function create_mgmt_subnet_v4 {
     local net_id=$2
     local name=$3
     local ip_range=$4
+    local gateway=$5
 
-    subnet_id=$(openstack subnet create --project ${project_id} --ip-version 4 --subnet-range ${ip_range} --gateway none --dns-nameserver 8.8.8.8 --network ${net_id} $name -c id -f value)
+    subnet_id=$(openstack subnet create --project ${project_id} --ip-version 4 --subnet-range ${ip_range} --gateway ${gateway} --dns-nameserver 8.8.8.8 --network ${net_id} $name -c id -f value)
     die_if_not_set $LINENO subnet_id "Failed to create private IPv4 subnet for network: ${net_id}, project: ${project_id}"
     echo $subnet_id
 }
@@ -362,7 +365,7 @@ function create_subnet_v6 {
     if [[ -n "$IPV6_PRIVATE_NETWORK_GATEWAY" ]]; then
         subnet_params+="--gateway $IPV6_PRIVATE_NETWORK_GATEWAY "
     fi
-    if [ -n $SUBNETPOOL_V6_ID ]; then
+    if [[ -n $SUBNETPOOL_V6_ID ]]; then
         subnet_params+="--subnet-pool $SUBNETPOOL_V6_ID "
     else
         subnet_params+="--subnet-range $FIXED_RANGE_V6 $ipv6_modes} "
@@ -379,7 +382,8 @@ function setup_mgmt_network() {
     local NET_NAME=$2
     local SUBNET_NAME=$3
     local SUBNET_RANGE=$4
-    local SHARED=$5
+    local SUBNET_GATEWAY=$5
+    local SHARED=$6
 
     local share_flag=""
     if [[ "${SHARED}" == "TRUE" ]]; then
@@ -390,9 +394,10 @@ function setup_mgmt_network() {
     die_if_not_set $LINENO network_id "Failed to create network: $NET_NAME, project: ${PROJECT_ID}"
 
     if [[ "$IP_VERSION" =~ 4.* ]]; then
-        net_subnet_id=$(create_mgmt_subnet_v4 ${PROJECT_ID} ${network_id} ${SUBNET_NAME} ${SUBNET_RANGE})
-        # 'openstack router add' has a bug that cound't show the error message
-        # openstack router add subnet ${ROUTER_ID} ${net_subnet_id} --debug
+        net_subnet_id=$(create_mgmt_subnet_v4 ${PROJECT_ID} ${network_id} ${SUBNET_NAME} ${SUBNET_RANGE} ${SUBNET_GATEWAY})
+        if [[ ${SUBNET_GATEWAY} != "none" ]]; then
+            openstack router add subnet ${ROUTER_ID} ${net_subnet_id}
+        fi
     fi
 
     # Trove doesn't support IPv6 for now.
@@ -404,13 +409,7 @@ function setup_mgmt_network() {
 
 # start_trove() - Start running processes, including screen
 function start_trove {
-    if [[ ${TROVE_USE_MOD_WSGI}" == TRUE" ]]; then
-        echo "Restarting Apache server ..."
-        enable_apache_site trove-api
-        restart_apache_server
-    else
-        run_process tr-api "$TROVE_BIN_DIR/trove-api --config-file=$TROVE_CONF"
-    fi
+    run_process tr-api "$(which uwsgi) --ini $TROVE_UWSGI_CONF"
     run_process tr-tmgr "$TROVE_BIN_DIR/trove-taskmanager --config-file=$TROVE_CONF"
     run_process tr-cond "$TROVE_BIN_DIR/trove-conductor --config-file=$TROVE_CONF"
 }
@@ -419,13 +418,7 @@ function start_trove {
 function stop_trove {
     # Kill the trove screen windows
     local serv
-    if [[ ${TROVE_USE_MOD_WSGI} == "TRUE" ]]; then
-        echo "Disabling Trove API in Apache"
-        disable_apache_site trove-api
-    else
-        stop_process tr-api
-    fi
-    for serv in tr-tmgr tr-cond; do
+    for serv in tr-api tr-tmgr tr-cond; do
         stop_process $serv
     done
 }
@@ -437,6 +430,52 @@ function configure_tempest_for_trove {
     if is_service_enabled tempest; then
         iniset $TEMPEST_CONFIG service_available trove True
     fi
+
+    echo "Enable trove-tempest-plugin"
+    pip_install $DEST/trove-tempest-plugin
+
+    if [ -d "$DEST/barbican-tempest-plugin" ]; then
+        # This command has a meaning only for developers DevStack installtion.
+        # In Zuul jobs, this plugin installed by tempest_plugins: section in jobs.yaml.
+        echo "Enable barbican-tempest-plugin"
+        pip_install -e $DEST/barbican-tempest-plugin
+    fi
+
+    echo "Adding [database] section to tempest.conf"
+    if [[ -n "$TROVE_DATASTORE_TYPE" ]]; then
+        iniset $TEMPEST_CONFIG database enabled_datastores $TROVE_DATASTORE_TYPE
+    else
+        iniset $TEMPEST_CONFIG database enabled_datastores mysql,mariadb,postgresql
+    fi
+    if [[ -n "$TROVE_DATASTORE_TYPE" && -n "$TROVE_DATASTORE_VERSION" ]]; then
+        iniset $TEMPEST_CONFIG database default_datastore_versions $TROVE_DATASTORE_TYPE:$TROVE_DATASTORE_VERSION
+    else
+        iniset $TEMPEST_CONFIG database default_datastore_versions ${TROVE_DATASTORES// /,}
+    fi
+
+    # Removing of swift account is forbidden by default
+    iniset $TEMPEST_CONFIG database remove_swift_account False
+}
+
+# Compute the docker image references to embed in the guest image and
+# export them as DIB_TROVE_DOCKER_IMAGES for the guest-agent element, which
+# fetches and tags them (see extra-data.d/70-trove-docker-images). Entries
+# are [source=]target references: the guest-visible target names (e.g. the
+# local registry) can't be pulled at build time, so the element pulls the
+# source and tags it as the target.
+function prepare_embedded_docker_images_vars {
+    local quay_alias=${TROVE_DATASTORE_TYPE}
+    [[ "${quay_alias}" == "postgresql" ]] && quay_alias="postgres"
+
+    local image_var="TROVE_DATABASE_IMAGE_${TROVE_DATASTORE_TYPE^^}"
+    local backup_var="TROVE_DATABASE_BACKUP_IMAGE_${TROVE_DATASTORE_TYPE^^}"
+
+    local pairs="quay.io/openstack.trove/${quay_alias}:${TROVE_DATASTORE_VERSION}=${!image_var}:${TROVE_DATASTORE_VERSION}"
+    if [[ "${TROVE_BUILD_BACKUP_IMAGES}" == "True" ]]; then
+        pairs+=" quay.io/openstack.trove/db-backup-${TROVE_DATASTORE_TYPE}:${TROVE_DATASTORE_VERSION}=${!backup_var}:${TROVE_DATASTORE_VERSION}"
+    fi
+
+    export DIB_TROVE_DOCKER_IMAGES="${pairs}"
 }
 
 # Use trovestack to create guest image and register the image in the datastore.
@@ -447,38 +486,158 @@ function create_guest_image {
         return 0
     fi
 
-    echo "Starting to create guest image..."
-
-    TROVE_BRANCH=${TROVE_BRANCH} $DEST/trove/integration/scripts/trovestack \
-      build-image \
-      ${TROVE_DATASTORE_TYPE} \
-      ${TROVE_IMAGE_OS} \
-      ${TROVE_IMAGE_OS_RELEASE} \
-      true
-
-    image_name="trove-datastore-${TROVE_IMAGE_OS}-${TROVE_IMAGE_OS_RELEASE}-${TROVE_DATASTORE_TYPE}"
+    image_name="trove-guest-${TROVE_IMAGE_OS}-${TROVE_IMAGE_OS_RELEASE}"
+    mkdir -p $HOME/images
     image_file=$HOME/images/${image_name}.qcow2
-    if [ ! -f ${image_file} ]; then
+
+    if [[ -n ${TROVE_NON_DEV_IMAGE_URL} ]]; then
+        echo "Downloading guest image from ${TROVE_NON_DEV_IMAGE_URL}"
+        curl -sSL ${TROVE_NON_DEV_IMAGE_URL} -o ${image_file}
+    else
+        echo "Starting to create guest image"
+        export SYNC_LOG_TO_CONTROLLER=${SYNC_LOG_TO_CONTROLLER:-"False"}
+        $DEST/trove/integration/scripts/trovestack \
+          build-image \
+          ${TROVE_IMAGE_OS} \
+          ${TROVE_IMAGE_OS_RELEASE} \
+          true \
+          ${TROVE_IMAGE_OS} \
+          ${image_file}
+    fi
+
+    if [[ ! -f ${image_file} ]]; then
         echo "Image file was not found at ${image_file}"
-        return 1
+        exit 1
     fi
 
     echo "Add the image to glance"
-    glance_image_id=$(openstack --os-region-name RegionOne --os-password ${SERVICE_PASSWORD} \
-      --os-project-name service --os-username trove \
+    glance_image_id=$(openstack --os-cloud trove \
       image create ${image_name} \
-      --disk-format qcow2 --container-format bare --property hw_rng_model='virtio' --file ${image_file} \
+      --disk-format qcow2 --container-format bare \
+      --tag trove \
+      --property hw_rng_model='virtio' \
+      --file ${image_file} \
+      --debug \
       -c id -f value)
+     echo "Glance image ${glance_image_id} uploaded"
 
     echo "Register the image in datastore"
-    $TROVE_MANAGE datastore_update $TROVE_DATASTORE_TYPE ""
-    $TROVE_MANAGE datastore_version_update $TROVE_DATASTORE_TYPE $TROVE_DATASTORE_VERSION $TROVE_DATASTORE_TYPE $glance_image_id "" 1
-    $TROVE_MANAGE datastore_update $TROVE_DATASTORE_TYPE $TROVE_DATASTORE_VERSION
+    for ds in $TROVE_DATASTORES; do
+        datastore=${ds%%:*}
+        version=${ds##*:}
 
-    echo "Add parameter validation rules if available"
-    if [ -f $DEST/trove/trove/templates/$TROVE_DATASTORE_TYPE/validation-rules.json ]; then
-        $TROVE_MANAGE db_load_datastore_config_parameters "$TROVE_DATASTORE_TYPE" "$TROVE_DATASTORE_VERSION" \
-            $DEST/trove/trove/templates/$TROVE_DATASTORE_TYPE/validation-rules.json
+        # filter by datastore type
+        if [[ -n "$TROVE_DATASTORE_TYPE" && "$datastore" != "$TROVE_DATASTORE_TYPE" ]]; then
+            continue
+        fi
+
+        # filter by datastore version
+        if [[ -n "$TROVE_DATASTORE_VERSION" && "$version" != "$TROVE_DATASTORE_VERSION" ]]; then
+            continue
+        fi
+
+        $TROVE_MANAGE datastore_update $datastore ""
+        $TROVE_MANAGE datastore_version_update $datastore $version $datastore "" "" 1 --image-tags trove
+        $TROVE_MANAGE datastore_update $datastore $version
+
+        echo "Add parameter validation rules if available"
+        if [[ -f $DEST/trove/trove/templates/$datastore/validation-rules.json ]]; then
+            echo "Loading $DEST/trove/trove/templates/$datastore/validation-rules.json"
+            $TROVE_MANAGE db_load_datastore_config_parameters "$datastore" "$version" \
+                $DEST/trove/trove/templates/$datastore/validation-rules.json
+        fi
+    done
+
+    # NOTE(wuchunyang): Create log directory so that guest agent can rsync logs to this directory
+    if [[ ${SYNC_LOG_TO_CONTROLLER} == "True" ]]; then
+    test -e /var/log/guest-agent-logs || sudo mkdir -p /var/log/guest-agent-logs/ && sudo chmod 777 /var/log/guest-agent-logs
+    fi
+}
+
+function create_registry_container {
+    # install docker on the host.
+    local ret='0'
+    which docker >/dev/null 2>&1 || { local ret='1'; }
+    if [[ "$ret" -ne 0 ]]; then
+        echo "Installing docker on the host"
+        $DEST/trove/integration/scripts/trovestack install-docker
+    fi
+    # running a docker registry container
+    echo "Running a docker registry container..."
+    container=$(sudo docker ps -a --format "{{.Names}}" --filter name=registry)
+    if [ -z $container ]; then
+        sudo docker run -d --net=host -e REGISTRY_HTTP_ADDR=0.0.0.0:$REGISTRY_PORT --restart=always \
+             -v /opt/trove_registry/:/var/lib/registry --name registry quay.io/openstack.trove/registry:2
+        for img in $TROVE_DATASTORES; do
+            datastore=${img%%:*}
+            version=${img##*:}
+
+            [[ "$datastore" == "postgresql" ]] && quay_alias="postgres" || quay_alias="$datastore"
+            quay_img="$quay_alias:$version"
+
+            sudo docker pull quay.io/openstack.trove/${quay_img} &&
+            sudo docker tag quay.io/openstack.trove/${quay_img} 127.0.0.1:$REGISTRY_PORT/trove-datastores/${img} &&
+            sudo docker push 127.0.0.1:$REGISTRY_PORT/trove-datastores/${img}
+
+            if [[ "$TROVE_BUILD_BACKUP_IMAGES" == "False" ]]; then
+                echo "Skip building backup image. We don't need it"
+                continue
+            fi
+
+            echo "Build backup image"
+
+            pushd $DEST/trove/backup
+            # build backup image
+            sudo docker build --network host -t 127.0.0.1:$REGISTRY_PORT/trove-datastores/db-backup-$datastore:$version \
+                 --build-arg DATASTORE=$datastore --build-arg DATASTORE_VERSION=$version .
+            popd
+
+            # push backup image
+            backupimg="db-backup-${img}"
+            sudo docker push 127.0.0.1:$REGISTRY_PORT/trove-datastores/${backupimg}
+        done
+        # clean up backup images.
+        sudo docker image prune -a -f
+    fi
+    iniset $TROVE_CONF DEFAULT docker_insecure_registries "$TROVE_HOST_GATEWAY:$REGISTRY_PORT,$LOCAL_HOSTNAME:$REGISTRY_PORT"
+}
+
+# NOTE(mangust404): Ensure that messaging and Docker image traffic go through
+# the management network. Otherwise, with the default configuration
+# (network_isolation=True), the instance will not become HEALTHY.
+# This operation may be done only when MGMT_PORT_IP will be known.
+function config_network_isolation {
+    TROVE_HOST_GATEWAY="$MGMT_PORT_IP"
+
+    # Pass local hostname with IP=$MGMT_PORT_IP to guests via /etc/hosts in cloudinit
+    configure_cloudinit $MGMT_PORT_IP
+
+    # Alter endpoints: use local hostname instead of IP address
+    openstack endpoint list -c ID -c URL -f value | while read -r ID URL; do
+        NEW_URL=$(echo $URL | sed -E "s/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/$LOCAL_HOSTNAME/")
+
+        if [ "$URL" != "$NEW_URL" ]; then
+            openstack endpoint set --url "$NEW_URL" "$ID"
+        fi
+    done
+
+    TROVE_AUTH_ENDPOINT="${TROVE_AUTH_ENDPOINT//\/\/*\//\/\/$LOCAL_HOSTNAME\/}"
+    echo "Set auth_url to $TROVE_AUTH_ENDPOINT"
+    iniset $TROVE_GUESTAGENT_CONF service_credentials auth_url $TROVE_AUTH_ENDPOINT
+
+    echo "Switch transport_url to $MGMT_PORT_IP"
+    iniset $TROVE_GUESTAGENT_CONF DEFAULT transport_url rabbit://$RABBIT_USERID:$RABBIT_PASSWORD@$LOCAL_HOSTNAME:$AMQP_PORT/
+
+    if [ "$TROVE_ENABLE_LOCAL_REGISTRY" == "True" ] ; then
+        echo "Change docker images paths to $LOCAL_HOSTNAME:$REGISTRY_PORT"
+        TROVE_DATABASE_IMAGE_MYSQL="$LOCAL_HOSTNAME:$REGISTRY_PORT/trove-datastores/mysql"
+        TROVE_DATABASE_IMAGE_MARIADB="$LOCAL_HOSTNAME:$REGISTRY_PORT/trove-datastores/mariadb"
+        TROVE_DATABASE_IMAGE_POSTGRESQL="$LOCAL_HOSTNAME:$REGISTRY_PORT/trove-datastores/postgresql"
+        TROVE_DATABASE_BACKUP_IMAGE_MYSQL="$LOCAL_HOSTNAME:$REGISTRY_PORT/trove-datastores/db-backup-mysql"
+        TROVE_DATABASE_BACKUP_IMAGE_MARIADB="$LOCAL_HOSTNAME:$REGISTRY_PORT/trove-datastores/db-backup-mariadb"
+        TROVE_DATABASE_BACKUP_IMAGE_POSTGRESQL="$LOCAL_HOSTNAME:$REGISTRY_PORT/trove-datastores/db-backup-postgresql"
+
+        configure_docker_images
     fi
 }
 
@@ -499,6 +658,7 @@ function config_trove_network {
     echo "  SUBNETPOOL_V4_ID: $SUBNETPOOL_V4_ID"
     echo "  ROUTER_GW_IP: $ROUTER_GW_IP"
     echo "  TROVE_MGMT_SUBNET_RANGE: ${TROVE_MGMT_SUBNET_RANGE}"
+    echo "  TROVE_MGMT_GATEWAY: ${TROVE_MGMT_GATEWAY}"
 
     # Save xtrace setting
     local orig_xtrace
@@ -507,7 +667,7 @@ function config_trove_network {
 
     echo "Creating Trove management network/subnet for Trove service project."
     trove_service_project_id=$(openstack project show $SERVICE_PROJECT_NAME -c id -f value)
-    setup_mgmt_network ${trove_service_project_id} ${TROVE_MGMT_NETWORK_NAME} ${TROVE_MGMT_SUBNET_NAME} ${TROVE_MGMT_SUBNET_RANGE}
+    setup_mgmt_network ${trove_service_project_id} ${TROVE_MGMT_NETWORK_NAME} ${TROVE_MGMT_SUBNET_NAME} ${TROVE_MGMT_SUBNET_RANGE} ${TROVE_MGMT_GATEWAY}
     mgmt_net_id=$(openstack network show ${TROVE_MGMT_NETWORK_NAME} -c id -f value)
     echo "Created Trove management network ${TROVE_MGMT_NETWORK_NAME}(${mgmt_net_id})"
 
@@ -519,7 +679,9 @@ function config_trove_network {
     if [[ "$shared" == "False" ]]; then
         openstack network set ${PRIVATE_NETWORK_NAME} --share
     fi
-    sudo ip route replace ${IPV4_ADDRS_SAFE_TO_USE} via $ROUTER_GW_IP
+    if [[ -n ${ROUTER_GW_IP} && -n ${IPV4_ADDRS_SAFE_TO_USE} ]]; then
+        sudo ip route replace ${IPV4_ADDRS_SAFE_TO_USE} via $ROUTER_GW_IP
+    fi
 
     # Make sure we can reach the management port of the service VM, this
     # configuration is only for testing purpose. In production, it's
@@ -547,7 +709,6 @@ function config_trove_network {
     sudo ip route
 
     # Now make sure the conf settings are right
-    iniset $TROVE_CONF DEFAULT network_label_regex ""
     iniset $TROVE_CONF DEFAULT ip_regex ""
     iniset $TROVE_CONF DEFAULT black_list_regex ""
     iniset $TROVE_CONF DEFAULT management_networks ${mgmt_net_id}
@@ -574,16 +735,13 @@ function config_nova_keypair {
     fi
 
     echo "Creating Trove management keypair ${TROVE_MGMT_KEYPAIR_NAME}"
-    openstack --os-region-name RegionOne --os-password ${SERVICE_PASSWORD} --os-project-name service --os-username trove \
-      keypair create --public-key ${SSH_DIR}/id_rsa.pub ${TROVE_MGMT_KEYPAIR_NAME}
+    openstack --os-cloud trove keypair create --user trove --public-key ${SSH_DIR}/id_rsa.pub ${TROVE_MGMT_KEYPAIR_NAME}
 
     iniset $TROVE_CONF DEFAULT nova_keypair ${TROVE_MGMT_KEYPAIR_NAME}
 }
 
 function config_cinder_volume_type {
-    volume_type=$(openstack --os-region-name RegionOne --os-password ${SERVICE_PASSWORD} \
-      --os-project-name service --os-username trove \
-      volume type list -c Name -f value | awk 'NR==1 {print}')
+    volume_type=$(openstack --os-cloud trove volume type list -c Name -f value | awk 'NR==1 {print}')
 
     iniset $TROVE_CONF DEFAULT cinder_volume_type ${volume_type}
 }
@@ -592,16 +750,36 @@ function config_mgmt_security_group {
     local sgid
 
     echo "Creating Trove management security group."
-    sgid=$(openstack --os-region-name RegionOne --os-password ${SERVICE_PASSWORD} --os-project-name service --os-username trove security group create ${TROVE_MGMT_SECURITY_GROUP} -f value -c id)
+    sgid=$(openstack --os-cloud trove security group create ${TROVE_MGMT_SECURITY_GROUP} -f value -c id)
 
     # Allow ICMP
-    openstack --os-region-name RegionOne --os-password ${SERVICE_PASSWORD} --os-project-name service --os-username trove \
-        security group rule create --proto icmp $sgid
+    openstack --os-cloud trove security group rule create --proto icmp $sgid
     # Allow SSH
-    openstack --os-region-name RegionOne --os-password ${SERVICE_PASSWORD} --os-project-name service --os-username trove \
-        security group rule create --protocol tcp --dst-port 22 $sgid
+    openstack --os-cloud trove security group rule create --protocol tcp --dst-port 22 $sgid
+    # Allow RabbitMQ
+    openstack --os-cloud trove security group rule create --protocol tcp --dst-port $AMQP_PORT $sgid
+    # Allow docker registry
+    openstack --os-cloud trove security group rule create --protocol tcp --dst-port $REGISTRY_PORT $sgid
+    # Allow keystone + other endpoints
+    openstack --os-cloud trove security group rule create --protocol tcp --dst-port 80 $sgid
+    openstack --os-cloud trove security group rule create --protocol tcp --dst-port 443 $sgid
+    # Allow swift endpoint
+    openstack --os-cloud trove security group rule create --protocol tcp --dst-port 8080 $sgid
 
     iniset $TROVE_CONF DEFAULT management_security_groups $sgid
+}
+
+function config_quotas {
+    # Default quotas are not sufficient for modern multi-core systems,
+    # so they are increased.
+    openstack quota set --cores 60 service
+    openstack quota set --instances 30 service
+    openstack quota set --ram 51200 service
+    openstack quota set --volumes 30 service
+    openstack quota set --snapshots 30 service
+    openstack quota set --backups 30 service
+    openstack quota set --secgroups 50 service
+    openstack quota set --secgroup-rules 300 service
 }
 
 # Dispatcher for trove plugin
@@ -622,8 +800,19 @@ if is_service_enabled trove; then
         config_nova_keypair
         config_cinder_volume_type
         config_mgmt_security_group
+        config_quotas
         config_trove_network
+        if [ "$TROVE_HOST_GATEWAY" != "$MGMT_PORT_IP" ]; then
+            config_network_isolation
+        fi
+        if [[ "${TROVE_EMBED_DATASTORE_IMAGES}" == "True" && \
+              -n "${TROVE_DATASTORE_TYPE:-}" && -n "${TROVE_DATASTORE_VERSION:-}" ]]; then
+            prepare_embedded_docker_images_vars
+        fi
         create_guest_image
+        if [ "$TROVE_ENABLE_LOCAL_REGISTRY" == "True" ] ; then
+            create_registry_container
+        fi
 
         echo_summary "Starting Trove"
         start_trove
@@ -631,6 +820,14 @@ if is_service_enabled trove; then
         # Guarantee the file permission in the trove code repo in order to
         # download trove code from trove-guestagent.
         sudo chown -R $STACK_USER:$STACK_USER "$DEST/trove"
+
+        # NOTE(mangust404): In some cases, the KVM group ID differs from the
+        # default value (992). We must set the group to "kvm" regardless of its
+        # numeric ID; otherwise, nova-compute will fail.
+        if [[ -e /dev/kvm ]] && [[ "$(stat -c '%G' /dev/kvm)" != "kvm" ]]; then
+            echo "Set group to kvm for /dev/kvm device"
+            sudo chgrp kvm /dev/kvm
+        fi
     elif [[ "$1" == "stack" && "$2" == "test-config" ]]; then
         echo_summary "Configuring Tempest for Trove"
         configure_tempest_for_trove

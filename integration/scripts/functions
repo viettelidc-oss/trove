@@ -1,4 +1,7 @@
 #!/bin/bash
+
+set -x
+
 # This file format was stolen from devstack <3
 
 # This method was stolen from devstack
@@ -14,7 +17,7 @@ function git_clone {
     GIT_DEST=$2
     GIT_BRANCH=$3
 
-    if echo $GIT_BRANCH | egrep -q "^refs"; then
+    if echo $GIT_BRANCH | grep -E "^refs"; then
         # If our branch name is a gerrit style refs/changes/...
         if [[ ! -d $GIT_DEST ]]; then
             git_timed clone $GIT_REMOTE $GIT_DEST
@@ -234,7 +237,8 @@ function is_fedora {
         GetOSVersion
     fi
 
-    [ "$os_VENDOR" = "Fedora" ] || [ "$os_VENDOR" = "Red Hat" ] || [ "$os_VENDOR" = "CentOS" ]
+    [ "$os_VENDOR" = "Fedora" ] || [ "$os_VENDOR" = "Red Hat" ]\
+    || [ "$os_VENDOR" = "CentOS" ] || [ "$os_VENDOR" = "CentOSStream" ]
 }
 
 
@@ -301,7 +305,7 @@ function git_checkout() {
 
     if [ -n "$REPO_BRANCH" ]; then
         pushd "$REPO_DIR"
-        if [ $PROJECT == "diskimage-builder" ] || [ $PROJECT == "tripleo-image-elements" ]; then
+        if [ $PROJECT == "diskimage-builder" ]; then
             REPO_BRANCH=master
         fi
         CURRENT_BRANCH=$(git branch | grep "\*" | awk '{print $2}')

@@ -14,7 +14,8 @@
 #    under the License.
 
 from hashlib import md5
-from mock import MagicMock, patch
+import http
+from unittest.mock import MagicMock, patch
 import json
 import os
 import socket
@@ -23,8 +24,6 @@ import swiftclient.client as swift_client
 import uuid
 
 from oslo_log import log as logging
-import six
-from six.moves import http_client
 from swiftclient import client as swift
 
 
@@ -56,14 +55,14 @@ class FakeSwiftConnection(object):
 
     def get_auth(self):
         return (
-            u"http://127.0.0.1:8080/v1/AUTH_c7b038976df24d96bf1980f5da17bd89",
-            u'MIINrwYJKoZIhvcNAQcCoIINoDCCDZwCAQExCTAHBgUrDgMCGjCCDIgGCSqGSIb3'
-            u'DQEHAaCCDHkEggx1eyJhY2Nlc3MiOiB7InRva2VuIjogeyJpc3N1ZWRfYXQiOiAi'
-            u'MjAxMy0wMy0xOFQxODoxMzoyMC41OTMyNzYiLCAiZXhwaXJlcyI6ICIyMDEzLTAz'
-            u'LTE5VDE4OjEzOjIwWiIsICJpZCI6ICJwbGFjZWhvbGRlciIsICJ0ZW5hbnQiOiB7'
-            u'ImVuYWJsZWQiOiB0cnVlLCAiZGVzY3JpcHRpb24iOiBudWxsLCAibmFtZSI6ICJy'
-            u'ZWRkd2FyZiIsICJpZCI6ICJjN2IwMzg5NzZkZjI0ZDk2YmYxOTgwZjVkYTE3YmQ4'
-            u'OSJ9fSwgInNlcnZpY2VDYXRhbG9nIjogW3siZW5kcG9pbnRzIjogW3siYWRtaW5')
+            "http://127.0.0.1:8080/v1/AUTH_c7b038976df24d96bf1980f5da17bd89",
+            'MIINrwYJKoZIhvcNAQcCoIINoDCCDZwCAQExCTAHBgUrDgMCGjCCDIgGCSqGSIb3'
+            'DQEHAaCCDHkEggx1eyJhY2Nlc3MiOiB7InRva2VuIjogeyJpc3N1ZWRfYXQiOiAi'
+            'MjAxMy0wMy0xOFQxODoxMzoyMC41OTMyNzYiLCAiZXhwaXJlcyI6ICIyMDEzLTAz'
+            'LTE5VDE4OjEzOjIwWiIsICJpZCI6ICJwbGFjZWhvbGRlciIsICJ0ZW5hbnQiOiB7'
+            'ImVuYWJsZWQiOiB0cnVlLCAiZGVzY3JpcHRpb24iOiBudWxsLCAibmFtZSI6ICJy'
+            'ZWRkd2FyZiIsICJpZCI6ICJjN2IwMzg5NzZkZjI0ZDk2YmYxOTgwZjVkYTE3YmQ4'
+            'OSJ9fSwgInNlcnZpY2VDYXRhbG9nIjogW3siZW5kcG9pbnRzIjogW3siYWRtaW5')
 
     def get_account(self):
         return ({'content-length': '2', 'accept-ranges': 'bytes',
@@ -79,10 +78,12 @@ class FakeSwiftConnection(object):
         LOG.debug("fake head_container(%s)", container)
         if container == 'missing_container':
             raise swift.ClientException('fake exception',
-                                        http_status=http_client.NOT_FOUND)
+                                        http_status=http.HTTPStatus.NOT_FOUND)
         elif container == 'unauthorized_container':
-            raise swift.ClientException('fake exception',
-                                        http_status=http_client.UNAUTHORIZED)
+            raise swift.ClientException(
+                'fake exception',
+                http_status=http.HTTPStatus.UNAUTHORIZED
+            )
         elif container == 'socket_error_on_head':
             raise socket.error(111, 'ECONNREFUSED')
         pass
@@ -102,16 +103,14 @@ class FakeSwiftConnection(object):
     def head_object(self, container, name):
         LOG.debug("fake put_container(%(container)s, %(name)s)",
                   {'container': container, 'name': name})
-        checksum = md5()
+        checksum = md5(usedforsecurity=False)
         if self.manifest_name == name:
             for object_name in sorted(self.container_objects):
-                object_checksum = md5(self.container_objects[object_name])
+                object_checksum = md5(
+                    self.container_objects[object_name], usedforsecurity=False)
                 # The manifest file etag for a HEAD or GET is the checksum of
                 # the concatenated checksums.
-                if six.PY3:
-                    checksum.update(object_checksum.hexdigest().encode())
-                else:
-                    checksum.update(object_checksum.hexdigest())
+                checksum.update(object_checksum.hexdigest().encode())
             # this is included to test bad swift segment etags
             if name.startswith("bad_manifest_etag_"):
                 return {'etag': '"this_is_an_intentional_bad_manifest_etag"'}
@@ -169,13 +168,13 @@ class FakeSwiftConnection(object):
             raise socket.error(111, 'ECONNREFUSED')
         headers = kwargs.get('headers', {})
         query_string = kwargs.get('query_string', '')
-        object_checksum = md5()
+        object_checksum = md5(usedforsecurity=False)
         if query_string == self.MANIFEST_QUERY_STRING_PUT:
             # the manifest prefix format is <container>/<prefix> where
             # container is where the object segments are in and prefix is the
             # common prefix for all segments.
             self.manifest_name = name
-            if isinstance(contents, six.text_type):
+            if isinstance(contents, str):
                 object_checksum.update(contents.encode('utf-8'))
             else:
                 object_checksum.update(contents)
@@ -339,14 +338,14 @@ class SwiftClientStub(Patcher):
                      'x-account-object-count': '0'}, self._containers_list)
 
         get_auth_return_value = (
-            u"http://127.0.0.1:8080/v1/AUTH_c7b038976df24d96bf1980f5da17bd89",
-            u'MIINrwYJKoZIhvcNAQcCoIINoDCCDZwCAQExCTAHBgUrDgMCGjCCDIgGCSqGSIb3'
-            u'DQEHAaCCDHkEggx1eyJhY2Nlc3MiOiB7InRva2VuIjogeyJpc3N1ZWRfYXQiOiAi'
-            u'MjAxMy0wMy0xOFQxODoxMzoyMC41OTMyNzYiLCAiZXhwaXJlcyI6ICIyMDEzLTAz'
-            u'LTE5VDE4OjEzOjIwWiIsICJpZCI6ICJwbGFjZWhvbGRlciIsICJ0ZW5hbnQiOiB7'
-            u'ImVuYWJsZWQiOiB0cnVlLCAiZGVzY3JpcHRpb24iOiBudWxsLCAibmFtZSI6ICJy'
-            u'ZWRkd2FyZiIsICJpZCI6ICJjN2IwMzg5NzZkZjI0ZDk2YmYxOTgwZjVkYTE3YmQ4'
-            u'OSJ9fSwgInNlcnZpY2VDYXRhbG9nIjogW3siZW5kcG9pbnRzIjogW3siYWRtaW5')
+            "http://127.0.0.1:8080/v1/AUTH_c7b038976df24d96bf1980f5da17bd89",
+            'MIINrwYJKoZIhvcNAQcCoIINoDCCDZwCAQExCTAHBgUrDgMCGjCCDIgGCSqGSIb3'
+            'DQEHAaCCDHkEggx1eyJhY2Nlc3MiOiB7InRva2VuIjogeyJpc3N1ZWRfYXQiOiAi'
+            'MjAxMy0wMy0xOFQxODoxMzoyMC41OTMyNzYiLCAiZXhwaXJlcyI6ICIyMDEzLTAz'
+            'LTE5VDE4OjEzOjIwWiIsICJpZCI6ICJwbGFjZWhvbGRlciIsICJ0ZW5hbnQiOiB7'
+            'ImVuYWJsZWQiOiB0cnVlLCAiZGVzY3JpcHRpb24iOiBudWxsLCAibmFtZSI6ICJy'
+            'ZWRkd2FyZiIsICJpZCI6ICJjN2IwMzg5NzZkZjI0ZDk2YmYxOTgwZjVkYTE3YmQ4'
+            'OSJ9fSwgInNlcnZpY2VDYXRhbG9nIjogW3siZW5kcG9pbnRzIjogW3siYWRtaW5')
 
         get_auth_patcher = patch.object(
             swift_client.Connection, 'get_auth',

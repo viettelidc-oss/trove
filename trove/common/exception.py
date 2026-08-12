@@ -61,6 +61,10 @@ class InvalidRPCConnectionReuse(TroveError):
     message = _("Invalid RPC Connection Reuse.")
 
 
+class InvalidValue(TroveError):
+    message = _("The value is not allowed: %(value)s.")
+
+
 class NotFound(TroveError):
 
     message = _("Resource %(uuid)s cannot be found.")
@@ -134,38 +138,38 @@ class DatastoresNotFound(NotFound):
 class DatastoreFlavorAssociationNotFound(NotFound):
 
     message = _("Flavor %(id)s is not supported for datastore "
-                "%(datastore)s version %(datastore_version)s")
+                "version %(datastore_version_id)s")
 
 
 class DatastoreFlavorAssociationAlreadyExists(TroveError):
 
     message = _("Flavor %(id)s is already associated with "
-                "datastore %(datastore)s version %(datastore_version)s")
+                "datastore version %(datastore_version_id)s")
 
 
 class DatastoreVolumeTypeAssociationNotFound(NotFound):
 
     message = _("The volume type %(id)s is not valid for datastore "
-                "%(datastore)s and version %(version_id)s.")
+                "version %(datastore_version_id)s.")
 
 
 class DatastoreVolumeTypeAssociationAlreadyExists(TroveError):
 
-    message = _("Datastore '%(datastore)s' version %(datastore_version)s "
+    message = _("Datastore version %(datastore_version_id)s "
                 "and volume-type %(id)s mapping already exists.")
 
 
 class DataStoreVersionVolumeTypeRequired(TroveError):
 
     message = _("Only specific volume types are allowed for a "
-                "datastore %(datastore)s version %(datastore_version)s. "
+                "datastore version %(datastore_version_id)s. "
                 "You must specify a valid volume type.")
 
 
 class DatastoreVersionNoVolumeTypes(TroveError):
 
     message = _("No valid volume types could be found for datastore "
-                "%(datastore)s and version %(datastore_version)s.")
+                "version %(datastore_version_id)s.")
 
 
 class DatastoreNoVersion(TroveError):
@@ -180,12 +184,25 @@ class DatastoreVersionInactive(TroveError):
 
 class DatastoreVersionAlreadyExists(BadRequest):
 
-    message = _("A datastore version with the name '%(name)s' already exists.")
+    message = _("The datastore version '%(name)s(%(version)s)' already "
+                "exists.")
 
 
 class DatastoreVersionsExist(BadRequest):
 
     message = _("Datastore versions exist for datastore %(datastore)s.")
+
+
+class DatastoreVersionsInUse(BadRequest):
+
+    message = _("Datastore version is in use by %(resource)s.")
+
+
+class DatastoreVersionsNoUniqueMatch(TroveError):
+
+    message = _("Multiple datastore versions found for '%(name)s', "
+                "use an UUID or specify both the name and version number to "
+                "be more specific.")
 
 
 class DatastoreDefaultDatastoreNotFound(TroveError):
@@ -214,12 +231,6 @@ class DatastoreOperationNotSupported(TroveError):
 
     message = _("The '%(operation)s' operation is not supported for "
                 "the '%(datastore)s' datastore.")
-
-
-class NoUniqueMatch(TroveError):
-
-    message = _("Multiple matches found for '%(name)s', "
-                "use an UUID to be more specific.")
 
 
 class OverLimit(TroveError):
@@ -302,7 +313,7 @@ class VolumeAttachmentsNotFound(NotFound):
 
 class VolumeCreationFailure(TroveError):
 
-    message = _("Failed to create a volume in Nova.")
+    message = _("Failed to create volume.")
 
 
 class VolumeSizeNotSpecified(BadRequest):
@@ -334,6 +345,16 @@ class ReplicationNotSupported(TroveError):
 class ReplicationSlaveAttachError(TroveError):
 
     message = _("Exception encountered attaching slave to new replica source.")
+
+
+class SlaveOperationNotSupported(TroveError):
+    message = _("The '%(operation)s' operation is not supported for slaves in "
+                "replication.")
+
+
+class UnableToDetermineLastMasterGTID(TroveError):
+    message = _("Unable to determine last GTID executed on master "
+                "(from file %(binlog_file)s).")
 
 
 class TaskManagerError(TroveError):
@@ -440,6 +461,12 @@ class BackupDatastoreMismatchError(TroveError):
     message = _("The datastore from which the backup was taken, "
                 "%(datastore1)s, does not match the destination"
                 " datastore of %(datastore2)s.")
+
+
+class BackupTooLarge(TroveError):
+    message = _("Backup is too large for given flavor or volume. "
+                "Backup size: %(backup_size)s GBs. "
+                "Available size: %(disk_size)s GBs.")
 
 
 class ReplicaCreateWithUsersDatabasesError(TroveError):
@@ -607,7 +634,16 @@ class PublicNetworkNotFound(TroveError):
 
 
 class NetworkConflict(BadRequest):
-    message = _("User network conflicts with the management network.")
+    message = _("User network conflicts with the reserved network.")
+
+
+class NetworkNotProvided(BadRequest):
+    message = _("Instance %(resource)s needs to be specified.")
+
+
+class SubnetNotFound(BadRequest):
+    message = _("Subnet %(subnet_id)s not found in the network "
+                "%(network_id)s.")
 
 
 class ClusterVolumeSizeRequired(TroveError):
@@ -664,15 +700,14 @@ class ClusterDatastoreNotSupported(TroveError):
                 "%(datastore)s-%(datastore_version)s.")
 
 
-class BackupTooLarge(TroveError):
-    message = _("Backup is too large for given flavor or volume. "
-                "Backup size: %(backup_size)s GBs. "
-                "Available size: %(disk_size)s GBs.")
-
-
 class ImageNotFound(NotFound):
 
     message = _("Image %(uuid)s cannot be found.")
+
+
+class ImageNotFoundByTags(NotFound):
+
+    message = _("Failed to retrieve image with tags: %(tags)s.")
 
 
 class LogAccessForbidden(Forbidden):
@@ -683,9 +718,3 @@ class LogAccessForbidden(Forbidden):
 class LogsNotAvailable(Forbidden):
 
     message = _("Log actions are not supported.")
-
-
-class SlaveOperationNotSupported(TroveError):
-
-    message = _("The '%(operation)s' operation is not supported for slaves in "
-                "replication.")

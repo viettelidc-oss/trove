@@ -23,43 +23,18 @@ handles RPC calls relating to Platform specific operations.
 
 """
 
-from itertools import chain
 import os
+
+from itertools import chain
 
 from oslo_log import log as logging
 
 from trove.common import cfg
+from trove.common import constants
 from trove.common.i18n import _
 from trove.common import utils
 
-
 LOG = logging.getLogger(__name__)
-defaults = {
-    'mysql':
-    'trove.guestagent.datastore.mysql.manager.Manager',
-    'percona':
-    'trove.guestagent.datastore.experimental.percona.manager.Manager',
-    'pxc':
-    'trove.guestagent.datastore.experimental.pxc.manager.Manager',
-    'redis':
-    'trove.guestagent.datastore.experimental.redis.manager.Manager',
-    'cassandra':
-    'trove.guestagent.datastore.experimental.cassandra.manager.Manager',
-    'couchbase':
-    'trove.guestagent.datastore.experimental.couchbase.manager.Manager',
-    'mongodb':
-    'trove.guestagent.datastore.experimental.mongodb.manager.Manager',
-    'postgresql':
-    'trove.guestagent.datastore.experimental.postgresql.manager.Manager',
-    'couchdb':
-    'trove.guestagent.datastore.experimental.couchdb.manager.Manager',
-    'vertica':
-    'trove.guestagent.datastore.experimental.vertica.manager.Manager',
-    'db2':
-    'trove.guestagent.datastore.experimental.db2.manager.Manager',
-    'mariadb':
-    'trove.guestagent.datastore.experimental.mariadb.manager.Manager'
-}
 CONF = cfg.CONF
 
 
@@ -68,8 +43,8 @@ def get_custom_managers():
 
 
 def datastore_registry():
-    return dict(chain(defaults.items(),
-                get_custom_managers().items()))
+    return dict(chain(constants.REGISTRY_EXT_DEFAULTS.items(),
+                      get_custom_managers().items()))
 
 
 def get_filesystem_volume_stats(fs_path):
@@ -89,6 +64,7 @@ def get_filesystem_volume_stats(fs_path):
         'block_size': stats.f_bsize,
         'total_blocks': stats.f_blocks,
         'free_blocks': stats.f_bfree,
+        'avail_blocks': stats.f_bavail,
         'total': total_gb,
         'free': free,
         'used': used_gb

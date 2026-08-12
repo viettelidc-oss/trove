@@ -13,72 +13,91 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
-from oslo_log import log as logging
-from oslo_utils import encodeutils
 
-from trove.common import exception
-from trove.common.i18n import _
-from trove.guestagent.backup.backupagent import BackupAgent
-from trove.guestagent.common import operating_system
-from trove.guestagent.common.operating_system import FileMode
-from trove.guestagent.datastore.mysql.service import MySqlApp
+from oslo_log import log as logging
+import semantic_version
+
+from trove.common import cfg
 from trove.guestagent.strategies.replication import mysql_base
 
-AGENT = BackupAgent()
-
 LOG = logging.getLogger(__name__)
+CONF = cfg.CONF
 
 
 class MysqlGTIDReplication(mysql_base.MysqlReplicationBase):
     """MySql Replication coordinated by GTIDs."""
 
-    class UnableToDetermineLastMasterGTID(exception.TroveError):
-        message = _("Unable to determine last GTID executed on master "
-                    "(from file %(binlog_file)s).")
-
-    def connect_to_master(self, service, snapshot):
-        if 'dataset' in snapshot:
+    def connect_to_master(self, service, master_info):
+        cur_ver = semantic_version.Version.coerce(CONF.datastore_version)
+        mysql_84 = semantic_version.Version('8.4.0')
+        if 'dataset' in master_info:
             # pull the last executed GTID from the master via
             # the xtrabackup metadata file. If that value is
             # provided we need to set the gtid_purged variable
             # before executing the CHANGE MASTER TO command
-            last_gtid = self._read_last_master_gtid()
-            LOG.debug("last_gtid value is %s", last_gtid)
-            # fix ['mysql-bin.000001', '154', '\n'] still existed last_gtid
-            # with '\n' value
-            if last_gtid and len(last_gtid) != 1:
+            if master_info.get('dataset', {}).get('log_executed_gtid_set'):
+                last_gtid = master_info['dataset']['log_executed_gtid_set']
+            else:
+                last_gtid = self.read_last_master_gtid(service)
+            LOG.info("last_gtid value is %s", last_gtid)
+            if '-' in last_gtid:
+                # Also, FLUSH PRIVILEGES will restore gtid_executed.
+                if cur_ver >= mysql_84:
+                    service.execute_sql('RESET BINARY LOGS AND GTIDS')
+                else:
+                    # for mysql 8.0
+                    service.execute_sql('RESET MASTER')
                 set_gtid_cmd = "SET GLOBAL gtid_purged='%s'" % last_gtid
-                LOG.debug("set gtid_purged with %s", set_gtid_cmd)
-                service.execute_on_client(set_gtid_cmd)
+                service.execute_sql(set_gtid_cmd)
 
-        logging_config = snapshot['log_position']
-        LOG.debug("connect_to_master %s", logging_config['replication_user'])
-        change_master_cmd = (
-            "CHANGE MASTER TO MASTER_HOST='%(host)s', "
-            "MASTER_PORT=%(port)s, "
-            "MASTER_USER='%(user)s', "
-            "MASTER_PASSWORD='%(password)s', "
-            "MASTER_AUTO_POSITION=1, "
-            "MASTER_CONNECT_RETRY=15" %
-            {
-                'host': snapshot['master']['host'],
-                'port': snapshot['master']['port'],
-                'user': logging_config['replication_user']['name'],
-                'password': logging_config['replication_user']['password']
-            })
-        service.execute_on_client(change_master_cmd)
+        replica_conf = master_info['replica_conf']
+        LOG.info(
+            "Configure the slave, master: %s:%s, replication user: %s",
+            master_info['master']['host'],
+            master_info['master']['port'],
+            replica_conf['replication_user']['name']
+        )
+        if cur_ver >= mysql_84:
+            change_master_cmd = (
+                "CHANGE REPLICATION SOURCE TO "
+                "SOURCE_HOST='%(host)s', "
+                "SOURCE_PORT=%(port)s, "
+                "SOURCE_USER='%(user)s', "
+                "SOURCE_PASSWORD='%(password)s', "
+                "SOURCE_AUTO_POSITION=1, "
+                "GET_SOURCE_PUBLIC_KEY=1, "
+                "SOURCE_CONNECT_RETRY=15" %
+                {
+                    'host': master_info['master']['host'],
+                    'port': master_info['master']['port'],
+                    'user': replica_conf['replication_user']['name'],
+                    'password': replica_conf['replication_user']['password']
+                })
+            if 'cert_container' in master_info and \
+               'ssl_mode' in master_info:
+                change_master_cmd = change_master_cmd + (
+                    ",SOURCE_SSL=1"
+                )
+        else:
+            change_master_cmd = (
+                "CHANGE MASTER TO "
+                "MASTER_HOST='%(host)s', "
+                "MASTER_PORT=%(port)s, "
+                "MASTER_USER='%(user)s', "
+                "MASTER_PASSWORD='%(password)s', "
+                "MASTER_AUTO_POSITION=1, "
+                "MASTER_CONNECT_RETRY=15" %
+                {
+                    'host': master_info['master']['host'],
+                    'port': master_info['master']['port'],
+                    'user': replica_conf['replication_user']['name'],
+                    'password': replica_conf['replication_user']['password']
+                })
+            if 'cert_container' in master_info and \
+               'ssl_mode' in master_info:
+                change_master_cmd = change_master_cmd + (
+                    ",MASTER_SSL=1"
+                )
+
+        service.execute_sql(change_master_cmd)
         service.start_slave()
-
-    def _read_last_master_gtid(self):
-        INFO_FILE = ('%s/xtrabackup_binlog_info' % MySqlApp.get_data_dir())
-        LOG.info("Setting read permissions on %s", INFO_FILE)
-        operating_system.chmod(INFO_FILE, FileMode.ADD_READ_ALL, as_root=True)
-        LOG.info("Reading last master GTID from %s", INFO_FILE)
-        try:
-            with open(INFO_FILE, 'rb') as f:
-                row = f.read().split(b'\t')
-                return encodeutils.safe_decode(row[2])
-        except (IOError, IndexError) as ex:
-            LOG.exception(ex)
-            raise self.UnableToDetermineLastMasterGTID(
-                {'binlog_file': INFO_FILE})

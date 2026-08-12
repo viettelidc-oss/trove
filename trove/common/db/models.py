@@ -14,7 +14,6 @@
 #    under the License.
 
 import abc
-import six
 
 from trove.common import cfg
 from trove.common.i18n import _
@@ -85,7 +84,7 @@ class DatastoreModelsBase(object):
         :param desc:         Description for exception message.
         :raises:             ValueError if not a string/unicode.
         """
-        if not isinstance(value, six.string_types):
+        if not isinstance(value, str):
             raise ValueError(_("%(desc)s is not a string. Type = %(t)s.")
                              % {'desc': desc, 't': type(value)})
 
@@ -114,6 +113,28 @@ class DatastoreSchema(DatastoreModelsBase):
     def name(self, value):
         self._validate_schema_name(value)
         self._name = value
+
+    @property
+    def collate(self):
+        return self._collate
+
+    @collate.setter
+    def collate(self, value):
+        if not value:
+            pass
+        else:
+            self._collate = value
+
+    @property
+    def character_set(self):
+        return self._character_set
+
+    @character_set.setter
+    def character_set(self, value):
+        if not value:
+            pass
+        else:
+            self._character_set = value
 
     def _validate_schema_name(self, value):
         """Perform checks on a given schema name.

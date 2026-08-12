@@ -38,7 +38,8 @@ Show resources quota for a specific project
 
 .. rest_method::  GET /v1.0/{project_id}/mgmt/quotas/{user_project}
 
-Admin only action by default.
+Admin can query resource quota of any project. The project user can only show
+the project's own quota.
 
 Normal response codes: 200
 
@@ -76,7 +77,12 @@ Update resources quota for a specific project
 
 .. rest_method::  PUT /v1.0/{project_id}/mgmt/quotas/{user_project}
 
-Admin only action by default.
+Admin only action by default. Supported resources:
+
+* instances
+* backups
+
+If not set, use the default resource quota in Trove configuration.
 
 Normal response codes: 200
 

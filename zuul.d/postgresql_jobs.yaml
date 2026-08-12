@@ -1,0 +1,151 @@
+# PostgreSQL jobs
+
+- job:
+    name: trove-tempest-ubuntu-base-postgresql
+    parent: trove-tempest-ubuntu-base
+    irrelevant-files:
+      - ^.*\.rst$
+      - ^api-ref/.*$
+      - ^doc/.*$
+      - ^etc/.*$
+      - ^releasenotes/.*$
+      - ^test-requirements.txt$
+      - ^tox.ini$
+      - ^LICENSE$
+      - ^contrib/
+      - ^backup/
+      - ^\..+
+      - ^trove/guestagent/strategies/replication/
+      - ^trove/guestagent/datastore/(mysql.*|mariadb)/.*$
+      - ^trove/tests/.*$
+    vars:
+        devstack_localrc:
+          TROVE_DATASTORE_TYPE: postgresql
+          TROVE_DATASTORE_VERSION: 18
+        devstack_local_conf:
+          test-config:
+            $TEMPEST_CONFIG:
+              database:
+                enabled_datastores: "postgresql"
+                default_datastore_versions: postgresql:18
+
+- job:
+    name: trove-tempest-ubuntu-backup-postgresql
+    parent: trove-tempest-ubuntu-backup
+    irrelevant-files:
+      - ^.*\.rst$
+      - ^api-ref/.*$
+      - ^doc/.*$
+      - ^etc/.*$
+      - ^releasenotes/.*$
+      - ^test-requirements.txt$
+      - ^tox.ini$
+      - ^LICENSE$
+      - ^contrib/
+      - ^\..+
+      - ^trove/guestagent/strategies/replication/
+      - ^trove/guestagent/datastore/(mysql.*|mariadb)/.*$
+      - ^trove/tests/.*$
+    vars:
+        devstack_localrc:
+          TROVE_DATASTORE_TYPE: postgresql
+          TROVE_DATASTORE_VERSION: 18
+        devstack_local_conf:
+          test-config:
+            $TEMPEST_CONFIG:
+              database:
+                enabled_datastores: "postgresql"
+                default_datastore_versions: postgresql:18
+
+- job:
+    name: trove-tempest-ubuntu-replication-postgresql
+    parent: trove-tempest-ubuntu-replication
+    irrelevant-files:
+      - ^.*\.rst$
+      - ^api-ref/.*$
+      - ^doc/.*$
+      - ^etc/.*$
+      - ^releasenotes/.*$
+      - ^test-requirements.txt$
+      - ^tox.ini$
+      - ^LICENSE$
+      - ^contrib/
+      - ^backup/
+      - ^\..+
+      - ^trove/guestagent/datastore/(mysql.*|mariadb)/.*$
+      - ^trove/guestagent/strategies/replication/(mariadb.*|mysql.*)\.py$
+      - ^trove/tests/.*$
+    vars:
+        devstack_localrc:
+          TROVE_DATASTORE_TYPE: postgresql
+          TROVE_DATASTORE_VERSION: 18
+        devstack_local_conf:
+          test-config:
+            $TEMPEST_CONFIG:
+              database:
+                enabled_datastores: "postgresql"
+                default_datastore_versions: postgresql:18
+
+- job:
+    name: trove-tempest-cinder-storage-driver-postgresql
+    parent:  trove-tempest-snapshot
+    irrelevant-files:
+      - ^.*\.rst$
+      - ^api-ref/.*$
+      - ^doc/.*$
+      - ^etc/.*$
+      - ^releasenotes/.*$
+      - ^test-requirements.txt$
+      - ^tox.ini$
+      - ^LICENSE$
+      - ^contrib/
+      - ^backup/
+      - ^\..+
+      - ^trove/guestagent/datastore/(mysql|mariadb)/.*$
+      - ^trove/guestagent/strategies/replication/(mysql.*|mariadb.*)\.py$
+      - ^trove/tests/.*$
+    vars:
+        devstack_localrc:
+          TROVE_DATASTORE_TYPE: postgresql
+          TROVE_DATASTORE_VERSION: 18
+        devstack_local_conf:
+          test-config:
+            $TEMPEST_CONFIG:
+              database:
+                backup_wait_timeout: 1200
+                enabled_datastores: "postgresql"
+                default_datastore_versions: postgresql:18
+
+- job:
+    name: trove-tempest-ubuntu-ssl-postgresql
+    parent: trove-tempest-ubuntu-ssl-base
+    files: !inherit
+      - ^trove/guestagent/.*postgresql.*\.py$
+    vars:
+        devstack_localrc:
+          TROVE_DATASTORE_TYPE: postgresql
+          TROVE_DATASTORE_VERSION: 18
+        devstack_local_conf:
+          test-config:
+            $TEMPEST_CONFIG:
+              database:
+                backup_wait_timeout: 1200
+                enabled_datastores: "postgresql"
+                default_datastore_versions: postgresql:18
+
+- job:
+    name: trove-tempest-ubuntu-ssl-replication-postgresql
+    parent: trove-tempest-ubuntu-ssl-replication
+    files: !inherit
+      - ^trove/guestagent/.*postgresql.*\.py$
+    vars:
+        devstack_localrc:
+          TROVE_DATASTORE_TYPE: postgresql
+          TROVE_DATASTORE_VERSION: 18
+        devstack_local_conf:
+          test-config:
+            $TEMPEST_CONFIG:
+              database:
+                backup_wait_timeout: 1200
+                enabled_datastores: "postgresql"
+                default_datastore_versions: postgresql:18

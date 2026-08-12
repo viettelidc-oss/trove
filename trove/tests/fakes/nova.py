@@ -13,17 +13,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
+import uuid
+
+import eventlet
+
 from novaclient import exceptions as nova_exceptions
 from oslo_log import log as logging
 
 from trove.common.exception import PollTimeOut
-from trove.common import instance as rd_instance
+from trove.instance import service_status as srvstatus
 from trove.tests.fakes.common import authorize
-
-import collections
-import eventlet
-import uuid
-
 
 LOG = logging.getLogger(__name__)
 FAKE_HOSTS = ["fake_host_1", "fake_host_2"]
@@ -129,7 +129,10 @@ class FakeServer(object):
 
     @property
     def addresses(self):
-        return {"private": [{"addr": "123.123.123.123"}]}
+        return [{
+            "address": "123.123.123.123",
+            'type': 'private',
+            'network': 'net-id'}]
 
     def confirm_resize(self):
         if self.status != "VERIFY_RESIZE":
@@ -326,7 +329,7 @@ class FakeServers(object):
             instance = DBInstance.find_by(compute_instance_id=id)
             LOG.debug("Setting server %s to running", instance.id)
             status = InstanceServiceStatus.find_by(instance_id=instance.id)
-            status.status = rd_instance.ServiceStatuses.RUNNING
+            status.status = srvstatus.ServiceStatuses.RUNNING
             status.save()
         eventlet.spawn_after(time_from_now, set_server_running)
 
@@ -359,7 +362,7 @@ class FakeRdServers(object):
 class FakeVolume(object):
 
     def __init__(self, parent, owner, id, size, name,
-                 description, volume_type):
+                 description, volume_type, availability_zone):
         self.attachments = []
         self.parent = parent
         self.owner = owner  # This is a context.
@@ -372,6 +375,7 @@ class FakeVolume(object):
         # point.
         self.device = "vdb"
         self.volume_type = volume_type
+        self.availability_zone = availability_zone
 
     def __repr__(self):
         msg = ("FakeVolume(id=%s, size=%s, name=%s, "
@@ -379,10 +383,6 @@ class FakeVolume(object):
         params = (self.id, self.size, self.name,
                   self.description, self._current_status)
         return (msg % params)
-
-    @property
-    def availability_zone(self):
-        return "fake-availability-zone"
 
     @property
     def created_at(self):
@@ -446,10 +446,11 @@ class FakeVolumes(object):
             else:
                 raise nova_exceptions.NotFound(404, "Bad permissions")
 
-    def create(self, size, name=None, description=None, volume_type=None):
+    def create(self, size, name=None, description=None, volume_type=None,
+               availability_zone=None):
         id = "FAKE_VOL_%s" % uuid.uuid4()
         volume = FakeVolume(self, self.context, id, size, name,
-                            description, volume_type)
+                            description, volume_type, availability_zone)
         self.db[id] = volume
         if size == 9:
             volume.schedule_status("error", 2)
@@ -579,7 +580,7 @@ class FakeHost(object):
                 'status': server.status
             })
             if (str(server.flavor_ref).startswith('http:') or
-               str(server.flavor_ref).startswith('https:')):
+                    str(server.flavor_ref).startswith('https:')):
                 flavor = FLAVORS.get_by_href(server.flavor_ref)
             else:
                 flavor = FLAVORS.get(server.flavor_ref)
@@ -742,7 +743,7 @@ class FakeSecurityGroupRules(object):
 
 class FakeServerGroup(object):
 
-    def __init__(self, name=None, policies=None, context=None):
+    def __init__(self, name=None, policies=None, description=None):
         self.name = name
         self.description = description
         self.id = "FAKE_SRVGRP_%s" % uuid.uuid4()

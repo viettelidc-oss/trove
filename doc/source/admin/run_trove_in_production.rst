@@ -71,10 +71,11 @@ services.
 Service Tenant Deployment
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 In production, almost all the cloud resources(except the Swift objects for
-backup data) created for a Trove instance should be only visible to the Trove
-service user. As DBaaS users, they should only see a Trove instance after
-creating, and know nothing about the Nova VM, Cinder volume, Neutron management
-network and security groups under the hood. The only way to operate Trove
+backup data and floating IP addresses for public instances) created for a Trove
+instance should be only visible to the Trove service user. As DBaaS users, they
+should only see a Trove instance after creating, and know nothing about the
+Nova VM, Cinder volume, Neutron management network and security groups under
+the hood. The only way to operate Trove
 instance is to interact with `Trove API
 <https://docs.openstack.org/api-ref/database/>`_.
 
@@ -93,6 +94,7 @@ Running multiple instances of the individual Trove controller components on
 separate physical hosts is recommended in order to provide scalability and
 availability of the controller software.
 
+.. _trove-management-network:
 
 Management Network
 ~~~~~~~~~~~~~~~~~~
@@ -150,8 +152,16 @@ guest instance doesn't affect other instances nor other cloud users.
 
 Configuring Trove
 ~~~~~~~~~~~~~~~~~
-The default Trove configuration file location is ``/etc/trove/trove.conf``. The
-typical config options (not a full list) are:
+The default Trove configuration file location is ``/etc/trove/trove.conf``. You
+can generate a sample config file by running:
+
+.. code-block:: console
+
+    cd <trove dir>
+    pip install -e .
+    oslo-config-generator --namespace trove.config --namespace oslo.messaging --namespace oslo.log --namespace oslo.policy --output-file /etc/trove/trove.conf.sample
+
+The typical config options (not a full list) are:
 
 DEFAULT group
   enable_secure_rpc_messaging
@@ -223,6 +233,9 @@ DEFAULT group
     Maximum time (in seconds) to wait for Guest Agent 'slow' requests (such as
     restarting the instance server) to complete.
 
+  database_service_uid
+    The UID(GID) of database service user.
+
 keystone_authtoken group
   Like most of other OpenStack services, Trove uses `Keystone Authentication
   Middleware
@@ -248,22 +261,169 @@ database group
     ``mysql+pymysql://root:password@127.0.0.1/trove?charset=utf8``
 
 The cloud administrator also needs to provide a policy file
-``/etc/trove/policy.json`` if the default API access policies don't satisfy the
+``/etc/trove/policy.yaml`` if the default API access policies don't satisfy the
 requirement. To generate a sample policy file with all the default policies,
 run ``tox -egenpolicy`` in the repo folder and the new file will be located in
 ``etc/trove/policy.yaml.sample``.
 
+.. warning::
+
+   JSON formatted policy file is deprecated since Trove 15.0.0 (Wallaby).
+   This `oslopolicy-convert-json-to-yaml`__ tool will migrate your existing
+   JSON-formatted policy file to YAML in a backward-compatible way.
+
+.. __: https://docs.openstack.org/oslo.policy/latest/cli/oslopolicy-convert-json-to-yaml.html
+
+Configure Trove Guest Agent
+"""""""""""""""""""""""""""
+The config file of trove guest agent is copied from trove controller node
+(default file path ``/etc/trove/trove-guestagent.conf``) when creating
+instance.
+
+Some config options specifically for trove guest agent:
+
+* Custom container image registry.
+
+  Trove guest agent pulls container images from docker hub by default, this can
+  be changed by setting:
+
+  .. code-block:: ini
+
+      [guest_agent]
+      container_registry =
+      container_registry_username =
+      container_registry_password =
+
+  Then in the specific database config section, the customized container
+  registry can be used, e.g.
+
+  .. code-block:: ini
+
+      [mysql]
+      docker_image = your-registry/your-repo/mysql
+      backup_docker_image = your-registry/your-repo/db-backup-mysql
+
+* Setting username, uid, gid for each datastore
+
+  Currently, when a database container is running, it is owned by user:
+  database (UID: 1001) and group: database (GID: 1001).
+
+  In some cases, you may need to set the owner of files,
+  directories or container to adapt to your own datastore image.
+
+  To achieve this, you can configure the option 
+  database_service_uname, database_service_uid, database_service_gid
+  in trove-guestagent.conf with following:
+
+  .. code-block:: ini
+
+      [<datastore_manage>]
+      database_service_uid = 1001
+      database_service_gid = 0
+      database_service_uname = postgres
+
+Make Trove work with multiple versions for each datastore
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When Trove do a backup/restore actions, The Trove guest agent pulls container
+images with tags matching the datastore version of the database instance running.
+To Ensure the trove guest agent can run backup/restore properly, you need to ensure
+the images with the proper tags already exists in the registry.
+Such as:
+If your datastore manager is 'mariadb' and its name is 'MariaDB',
+and it has 2 datastore versions:
+
+  .. code-block:: bash
+
+      openstack datastore version list MariaDB
+      +--------------------------------------+------+---------+
+      | ID                                   | Name | Version |
+      +--------------------------------------+------+---------+
+      | 550aebf7-df97-49f1-bf24-7cd7b69fa365 | 10.3 | 10.3    |
+      | ee988cc3-bb30-4aaf-9837-e90a34f60d37 | 10.4 | 10.4    |
+      +--------------------------------------+------+---------+
+
+Configure the ``backup_docker_image`` options like following:
+
+.. path /etc/trove/trove-guestagent.conf
+.. code-block:: ini
+
+      [mariadb]
+      # Database docker image. (string value)
+      docker_image = your-registry/your-repo/db-mariadb
+
+      # The docker image used for backup and restore. (string value)
+      backup_docker_image = your-registry/your-repo/db-backup-mariadb
+
+.. note::
+
+    Do not configure the image tag for the image. because if the image doesn't
+    contain the tag, Trove will use the datastore version as the tag.
+
+Administrators need to ensure that the Docker backup image has 2 tags (10.3 & 10.4)
+in docker registry. For example:
+your-registry/your-repo/db-backup-mariadb:10.3 & your-registry/your-repo/db-backup-mariadb:10.4
+
+Finally, when trove-guestagent does backup/restore, it will pull this image with the tag equals datastore version.
+
+Configure backup storage strategy
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+By default, trove uses swift as backup storage backend. when using the swift storage backend, it's relatively slow to
+backup and restore instances. as trove guest agent needs to run backup container first, then do backup action and
+save it to swift finally.
+
+trove also supports cinder storage strategy. Compare to Swift, Cinder can do backup/restore action quickly, because
+guest agent doesn't need to do backup in instance, instead, Trove taskmanager calls Cinder api to do a snapshot for
+the data disk. and then restore from the snapshot later.
+
+pros and cons of swift and cinder:
+
+* Swift backend supports restoring from any places that are accessible but more slow.
+* Cinder backend backs up more quickly but doesn't support restore across storage system.
+
+administrator can configure different strategies for backing up and replications according to the demands.
+
+For example:
+
+Setting the relevant opts in `/etc/trove/trove-guestagent.conf`
+
+.. path /etc/trove/trove-guestagent.conf
+.. code-block:: ini
+
+      [DEFAULT]
+      storage_strategy = swift
+      replica_snapshot_driver = cinder
+
+Setting the relevant opts in `/etc/trove/trove.conf` as well.
+
+.. path /etc/trove/trove.conf
+.. code-block:: ini
+
+      [DEFAULT]
+      storage_strategy = swift
+      replica_snapshot_driver = cinder
+
+.. note::
+
+  administrator needs to set these opts in both `trove-geustagent.conf` and `trove.conf`
+
 
 Initialize Trove Database
 ~~~~~~~~~~~~~~~~~~~~~~~~~
-This is controlled through `sqlalchemy-migrate
-<https://code.google.com/archive/p/sqlalchemy-migrate/>`_ scripts under the
-trove/db/sqlalchemy/migrate_repo/versions directory in this repository. The
+
+.. versionchanged:: Caracal
+
+   The database migration engine was changed from ``sqlalchemy-migrate`` to
+   ``alembic``, and the ``sqlalchemy-migrate`` was removed.
+
+This is controlled through `alembic`__ scripts under the
+trove/db/sqlalchemy/migrations/versions directory in this repository. The
 script ``trove-manage`` (which should be installed together with Trove
 controller software) could be used to aid in the initialization of the Trove
 database. Note that this tool looks at the ``/etc/trove/trove.conf`` file for
 its database credentials, so initializing the database must happen after Trove
 is configured.
+
+.. __: https://alembic.sqlalchemy.org/en/latest/
 
 
 Launching the Trove Controller
@@ -274,6 +434,9 @@ Trove controller are all started and kept running.
 
 Preparing the Guest Images
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
+Currently supported databases are: MySQL 5.7.X, MariaDB 10.4.X. PostgreSQL 12.4
+is partially supported.
+
 Now that the Trove system is installed, the next step is to build the images
 that we will use for the DBaaS to function properly. This is possibly the most
 important step as this will be the gold standard that Trove will use for a
@@ -286,6 +449,10 @@ particular data store.
     should strictly be used for testing and development use and should not be
     used in a production environment. The images are available for download and
     are located at http://tarballs.openstack.org/trove/images/.
+
+From Victoria release, Trove uses a single guest image for all the supported
+datastores. Database service is running as docker container inside the trove
+instance which simplifies the datastore management and maintenance.
 
 For use with production systems, it is recommended to create and maintain your
 own images in order to conform to standards set by the company's security team.
@@ -301,7 +468,8 @@ for more information. Make sure to use ``dev_mode=false`` for production
 environment.
 
 After image is created successfully, the cloud administrator needs to upload
-the image to Glance and make it only accessible to service users.
+the image to Glance and make it only accessible to service users. It's
+recommended to use tags when creating Glance image.
 
 
 Preparing the Datastore
@@ -311,12 +479,26 @@ datastore versions and the configuration parameters for the particular version.
 
 It's recommended to config a default version for each datastore.
 
+``trove-manage`` can be only used on trove controller node.
+
+Command examples:
+
+.. code-block:: console
+
+    $ # Creating datastore 'mysql' and datastore version 5.7.29.
+    $ openstack datastore version create 5.7.29 mysql mysql "" \
+      --image-tags trove,mysql \
+      --active --default \
+      --version-number 5.7.29
+    $ # Register configuration parameters for the datastore version
+    $ trove-manage db_load_datastore_config_parameters mysql 5.7.29 ${trove_repo_dir}}/trove/templates/mysql/validation-rules.json
+
 
 Quota Management
 ~~~~~~~~~~~~~~~~
 The amount of resources that could be created by each OpenStack project is
-controlled by quota. The default resource quota for each project is set in
-Trove config file as follows unless changed by the cloud administrator via
+controlled by quota. The default trove resource quota for each project is set
+in Trove config file as follows unless changed by the cloud administrator via
 `Quota API
 <https://docs.openstack.org/api-ref/database/#update-resources-quota-for-a-specific-project>`_.
 
@@ -325,6 +507,19 @@ Trove config file as follows unless changed by the cloud administrator via
     [DEFAULT]
     max_instances_per_tenant = 10
     max_backups_per_tenant = 50
+
+In the meantime, trove service project itself also needs quota to create cloud
+resources corresponding to the trove instances, e.g.
+
+.. code-block:: console
+
+   openstack quota set \
+     --instances 200 \
+     --server-groups 200 \
+     --volumes 200 \
+     --secgroups 200 \
+     --ports 400 \
+     <trove-service-project>
 
 
 Trove Deployment Verfication
@@ -336,3 +531,21 @@ V1 API.
 Refer to `Create and access a database
 <https://docs.openstack.org/trove/latest/user/create-db.html>`_ for detailed
 steps.
+
+
+Nova microversions
+~~~~~~~~~~~~~~~~~~
+The Nova microversion used by Trove is controlled by the `CONF.nova_client_version`
+configuration option.
+
+The minimum required microversion for Trove to function is **2.12**.
+
+The table below lists microversions that enable specific features used by Trove:
+
++---------------------+-------------------------------------------+
+| Nova microversion   | Feature                                   |
++=====================+===========================================+
+| 2.52                | Support for instance tags                 |
++---------------------+-------------------------------------------+
+| 2.57                | Support for updating user data on rebuild |
++---------------------+-------------------------------------------+

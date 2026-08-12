@@ -15,6 +15,7 @@
 import routes
 
 from trove.backup.service import BackupController
+from trove.backup.service import BackupStrategyController
 from trove.cluster.service import ClusterController
 from trove.common import wsgi
 from trove.configuration.service import ConfigurationsController
@@ -25,7 +26,6 @@ from trove.instance.service import InstanceController
 from trove.limits.service import LimitsController
 from trove.module.service import ModuleController
 from trove.versions import VersionsController
-from trove.volume_type.service import VolumeTypesController
 
 
 class API(wsgi.Router):
@@ -37,10 +37,10 @@ class API(wsgi.Router):
         self._cluster_router(mapper)
         self._datastore_router(mapper)
         self._flavor_router(mapper)
-        self._volume_type_router(mapper)
         self._versions_router(mapper)
         self._limits_router(mapper)
         self._backups_router(mapper)
+        self._backup_strategy_router(mapper)
         self._configurations_router(mapper)
         self._modules_router(mapper)
 
@@ -129,6 +129,14 @@ class API(wsgi.Router):
                        controller=instance_resource,
                        action="guest_log_action",
                        conditions={'method': ['POST']})
+        mapper.connect("/{tenant_id}/instances/{id}/ssl",
+                       controller=instance_resource,
+                       action="ssl_show",
+                       conditions={'method': ['GET']})
+        mapper.connect("/{tenant_id}/instances/{id}/ssl",
+                       controller=instance_resource,
+                       action="ssl_action",
+                       conditions={'method': ['POST']})
         mapper.connect("/{tenant_id}/instances/{id}/modules",
                        controller=instance_resource,
                        action="module_list",
@@ -181,17 +189,6 @@ class API(wsgi.Router):
                        action="show",
                        conditions={'method': ['GET']})
 
-    def _volume_type_router(self, mapper):
-        volume_type_resource = VolumeTypesController().create_resource()
-        mapper.connect("/{tenant_id}/volume-types",
-                       controller=volume_type_resource,
-                       action="index",
-                       conditions={'method': ['GET']})
-        mapper.connect("/{tenant_id}/volume-types/{id}",
-                       controller=volume_type_resource,
-                       action="show",
-                       conditions={'method': ['GET']})
-
     def _limits_router(self, mapper):
         limits_resource = LimitsController().create_resource()
         mapper.connect("/{tenant_id}/limits",
@@ -215,6 +212,21 @@ class API(wsgi.Router):
                        conditions={'method': ['GET']})
         mapper.connect("/{tenant_id}/backups/{id}",
                        controller=backups_resource,
+                       action="delete",
+                       conditions={'method': ['DELETE']})
+
+    def _backup_strategy_router(self, mapper):
+        backup_strategy_resource = BackupStrategyController().create_resource()
+        mapper.connect("/{tenant_id}/backup_strategies",
+                       controller=backup_strategy_resource,
+                       action="create",
+                       conditions={'method': ['POST']})
+        mapper.connect("/{tenant_id}/backup_strategies",
+                       controller=backup_strategy_resource,
+                       action="index",
+                       conditions={'method': ['GET']})
+        mapper.connect("/{tenant_id}/backup_strategies",
+                       controller=backup_strategy_resource,
                        action="delete",
                        conditions={'method': ['DELETE']})
 

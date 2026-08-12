@@ -12,7 +12,7 @@
 
 import re
 
-import pep8
+from hacking import core
 
 _all_log_levels = (
     'critical',
@@ -34,6 +34,7 @@ def _translation_is_not_expected(filename):
     return any(pat in filename for pat in ["/tests/"])
 
 
+@core.flake8ext
 def check_raised_localized_exceptions(logical_line, filename):
     """T103 - Untranslated exception message.
     :param logical_line: The logical line to check.
@@ -55,31 +56,20 @@ def check_raised_localized_exceptions(logical_line, filename):
             yield (logical_line.index(exception_msg), msg)
 
 
-def check_no_basestring(logical_line):
-    """T104 - Don't use basestring, use six.string_types instead
-       basestring is not supported by py3, using six.string_types to ensure
-       py3 and py2 compatibility
-    """
-    if re.search(r"\, basestring\)", logical_line):
-        msg = ("T104: basestring is not Python3-compatible, use "
-               "six.string_types instead.")
-        yield(0, msg)
-
-
-def no_translate_logs(logical_line, physical_line, filename):
+@core.flake8ext
+def no_translate_logs(logical_line, filename, noqa):
     """T105 - Log messages shouldn't be translated from the
     Pike release.
     :param logical_line: The logical line to check.
-    :param physical_line: The physical line to check.
     :param filename: The file name where the logical line exists.
+    :param noqa: whether the check should be skipped
     :returns: None if the logical line passes the check, otherwise a tuple
     is yielded that contains the offending index in logical line and a
     message describe the check validation failure.
     """
-    if _translation_is_not_expected(filename):
+    if noqa:
         return
-
-    if pep8.noqa(physical_line):
+    if _translation_is_not_expected(filename):
         return
 
     msg = "T105: Log message shouldn't be translated."
@@ -87,22 +77,13 @@ def no_translate_logs(logical_line, physical_line, filename):
         yield (0, msg)
 
 
-asse_raises_regexp = re.compile(r"assertRaisesRegexp\(")
+@core.flake8ext
+def no_log_warn(logical_line):
+    """Disallow 'LOG.warn('
 
+    https://bugs.launchpad.net/tempest/+bug/1508442
 
-def assert_raises_regexp(logical_line):
-    """Check for usage of deprecated assertRaisesRegexp
-
-    N335
+    T106
     """
-    res = asse_raises_regexp.search(logical_line)
-    if res:
-        yield (0, "N335: assertRaisesRegex must be used instead "
-                  "of assertRaisesRegexp")
-
-
-def factory(register):
-    register(check_raised_localized_exceptions)
-    register(check_no_basestring)
-    register(no_translate_logs)
-    register(assert_raises_regexp)
+    if logical_line.startswith('LOG.warn('):
+        yield (0, 'T106 Use LOG.warning() rather than LOG.warn()')

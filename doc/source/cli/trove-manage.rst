@@ -201,6 +201,9 @@ trove-manage datastore_version_update
    usage: trove-manage datastore_version_update [-h]
                                                 datastore version_name manager
                                                 image_id packages active
+                                                --image-tags <image_tags>
+                                                --registry-ext <registry_ext>
+                                                --repl-strategy <repl_strategy>
 
 Add or update a datastore version. If the datastore version already exists,
 all values except the datastore name and version will be updated.
@@ -231,6 +234,21 @@ all values except the datastore name and version will be updated.
 
 ``-h, --help``
   show this help message and exit
+
+``--image-tags``
+  List of image tags separated by comma. If the image ID is not provided
+  explicitly, the image can be retrieved by the image tags. Multiple image tags
+  are separated by comma, e.g. trove,mysql. Using image tags is more flexible
+  than ID especially when new guest image is uploaded to Glance, Trove can pick
+  up the latest image automatically for creating instances.
+
+``--registry-ext``
+  Extension for default datastore version managers. Allows the use of custom managers
+  for each of the datastore versions supported by Trove.
+
+``--repl-strategy``
+    Extension for default strategy for replication. Allows the use of custom
+    replication strategy for each of the datastores supported by Trove.
 
 trove-manage db_downgrade
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -286,6 +304,10 @@ into the database.
 
 trove-manage db_recreate
 ~~~~~~~~~~~~~~~~~~~~~~~~
+.. caution::
+
+   Running this command will drop the database and recreate it. It means all
+   data in the database will be lost. Becareful when running this command.
 
 .. code-block:: console
 

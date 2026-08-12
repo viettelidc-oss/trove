@@ -14,13 +14,15 @@
 #    under the License.
 """I totally stole most of this from melange, thx guys!!!"""
 
-import collections
+from collections import abc
 import inspect
 import os
+import shlex
 import shutil
+import subprocess
+import urllib.parse as urlparse
 import uuid
 
-from eventlet.timeout import Timeout
 import jinja2
 from oslo_concurrency import processutils
 from oslo_log import log as logging
@@ -28,11 +30,9 @@ from oslo_service import loopingcall
 from oslo_utils.encodeutils import safe_encode
 from oslo_utils import importutils
 from oslo_utils import strutils
-from passlib import pwd
-import six
-import six.moves.urllib.parse as urlparse
 
 from trove.common import cfg
+from trove.common import crypto_utils
 from trove.common import exception
 from trove.common.i18n import _
 
@@ -57,6 +57,7 @@ def build_jinja_environment():
     env.globals['max'] = max
     env.globals['min'] = min
     return env
+
 
 ENV = build_jinja_environment()
 
@@ -174,7 +175,7 @@ class MethodInspector(object):
 
     @cached_property
     def argspec(self):
-        return inspect.getargspec(self._func)
+        return inspect.getfullargspec(self._func)
 
     def __str__(self):
         optionals = ["[{0}=<{0}>]".format(k) for k, v in self.optional_args]
@@ -184,7 +185,7 @@ class MethodInspector(object):
 
 
 def build_polling_task(retriever, condition=lambda value: value,
-                       sleep_time=1, time_out=0):
+                       sleep_time=1, time_out=0, initial_delay=0):
     """Run a function in a loop with backoff on error.
 
     The condition function runs based on the retriever function result.
@@ -196,7 +197,8 @@ def build_polling_task(retriever, condition=lambda value: value,
             raise loopingcall.LoopingCallDone(retvalue=obj)
 
     call = loopingcall.BackOffLoopingCall(f=poll_and_check)
-    return call.start(initial_delay=0, starting_interval=sleep_time,
+    return call.start(initial_delay=initial_delay,
+                      starting_interval=sleep_time,
                       max_interval=30, timeout=time_out)
 
 
@@ -209,7 +211,7 @@ def wait_for_task(polling_task):
 
 
 def poll_until(retriever, condition=lambda value: value,
-               sleep_time=3, time_out=0):
+               sleep_time=3, time_out=0, initial_delay=0):
     """Retrieves object until it passes condition, then returns it.
 
     If time_out_limit is passed in, PollTimeOut will be raised once that
@@ -217,7 +219,8 @@ def poll_until(retriever, condition=lambda value: value,
 
     """
     task = build_polling_task(retriever, condition=condition,
-                              sleep_time=sleep_time, time_out=time_out)
+                              sleep_time=sleep_time, time_out=time_out,
+                              initial_delay=initial_delay)
     return wait_for_task(task)
 
 
@@ -236,12 +239,11 @@ def get_id_from_href(href):
 
 
 def execute_with_timeout(*args, **kwargs):
-    time = kwargs.pop('timeout', CONF.command_process_timeout)
+    timeout = kwargs.pop('timeout', CONF.command_process_timeout)
     log_output_on_error = kwargs.pop('log_output_on_error', False)
 
-    timeout = Timeout(time)
     try:
-        return execute(*args, **kwargs)
+        return execute(*args, timeout=timeout, **kwargs)
     except exception.ProcessExecutionError as e:
         if log_output_on_error:
             LOG.error(
@@ -252,24 +254,21 @@ def execute_with_timeout(*args, **kwargs):
                  'exit_code': e.exit_code, 'stderr': e.stderr,
                  'stdout': e.stdout})
         raise
-    except Timeout as t:
-        if t is not timeout:
-            LOG.error("Got a timeout but not the one expected.")
-            raise
-        else:
-            log_fmt = ("Time out after waiting "
-                       "%(time)s seconds when running proc: %(args)s"
-                       " %(kwargs)s.")
-            exc_fmt = _("Time out after waiting "
-                        "%(time)s seconds when running proc: %(args)s"
-                        " %(kwargs)s.")
-            msg_content = {
-                'time': time, 'args': args,
-                'kwargs': kwargs}
-            LOG.error(log_fmt, msg_content)
-            raise exception.ProcessExecutionError(exc_fmt % msg_content)
-    finally:
-        timeout.cancel()
+    except subprocess.TimeoutExpired:
+        log_fmt = ("Time out after waiting "
+                   "%(timeout)s seconds when running proc: %(args)s"
+                   " %(kwargs)s.")
+        exc_fmt = _("Time out after waiting "
+                    "%(timeout)s seconds when running proc: %(args)s"
+                    " %(kwargs)s.")
+        msg_content = {
+            'timeout': timeout, 'args': args,
+            'kwargs': kwargs}
+        LOG.error(log_fmt, msg_content)
+        raise exception.ProcessExecutionError(exc_fmt % msg_content)
+    except Exception:
+        LOG.error("Exception other than ProcessExecutionError")
+        raise
 
 
 def correct_id_with_req(id, request):
@@ -295,7 +294,7 @@ def generate_random_password(password_length=None):
         password_length or
         cfg.get_configuration_property('default_password_length')
     )
-    return pwd.genword(length=password_length)
+    return crypto_utils.generate_random_key(length=password_length)
 
 
 def try_recover(func):
@@ -329,8 +328,8 @@ def unpack_singleton(container):
 def is_collection(item):
     """Return True is a given item is an iterable collection, but not a string.
     """
-    return (isinstance(item, collections.Iterable) and
-            not isinstance(item, (bytes, six.text_type)))
+    return (isinstance(item, abc.Iterable) and
+            not isinstance(item, (bytes, str)))
 
 
 def format_output(message, format_len=79, truncate_len=None, replace_index=0):
@@ -421,3 +420,13 @@ def req_to_text(req):
         parts.extend([b'', safe_encode(req.body)])
 
     return b'\r\n'.join(parts).decode(req.charset)
+
+
+def validate_command(string):
+    """
+    Check if the string is legal for command
+
+    raise invalidvalue if illegal
+    """
+    if string != shlex.quote(string):
+        raise exception.InvalidValue(value=string)

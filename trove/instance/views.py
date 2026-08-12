@@ -35,12 +35,18 @@ class InstanceView(object):
             "id": self.instance.id,
             "name": self.instance.name,
             "status": self.instance.status,
+            "operating_status": self.instance.operating_status,
             "links": self._build_links(),
             "flavor": self._build_flavor_info(),
-            "datastore": {"type": self.instance.datastore.name,
-                          "version": self.instance.datastore_version.name},
-            "region": self.instance.region_name
+            "datastore": {"type": None, "version": None},
+            "region": self.instance.region_name,
+            "access": {}
         }
+        if self.instance.datastore_version:
+            instance_dict['datastore'] = {
+                "type": self.instance.datastore.name,
+                "version": self.instance.datastore_version.name
+            }
         if self.context.is_admin:
             instance_dict['tenant_id'] = self.instance.tenant_id
         if self.instance.volume_support:
@@ -49,12 +55,28 @@ class InstanceView(object):
         if self.instance.hostname:
             instance_dict['hostname'] = self.instance.hostname
         else:
-            ip = self.instance.get_visible_ip_addresses()
-            if ip:
-                instance_dict['ip'] = ip
+            addresses = self.instance.get_visible_ip_addresses()
+            if addresses:
+                # NOTE(lxkong): 'ip' is deprecated in stable/ussuri and should
+                # be removed in W.
+                instance_dict['ip'] = [addr['address'] for addr in addresses]
+                instance_dict['addresses'] = addresses
 
         if self.instance.slave_of_id is not None:
             instance_dict['replica_of'] = self._build_master_info()
+
+        if self.instance.slaves:
+            instance_dict['replicas'] = self._build_slaves_info()
+
+        if self.instance.access:
+            instance_dict['access'] = self.instance.access
+        elif 'addresses' in instance_dict:
+            for addr in instance_dict['addresses']:
+                if addr.get('type') == 'public':
+                    instance_dict['access']['is_public'] = True
+                    break
+            else:
+                instance_dict['access']['is_public'] = False
 
         LOG.debug(instance_dict)
         return {"instance": instance_dict}
@@ -79,6 +101,16 @@ class InstanceView(object):
                                   self.instance.slave_of_id)
         }
 
+    def _build_slaves_info(self):
+        data = []
+        for slave in self.instance.slaves:
+            data.append({
+                "id": slave.id,
+                "links": create_links("instances", self.req, slave.id)
+            })
+
+        return data
+
 
 class InstanceDetailView(InstanceView):
     """Works with a full-blown instance."""
@@ -94,14 +126,15 @@ class InstanceDetailView(InstanceView):
         result['instance']['service_status_updated'] = (self.instance.
                                                         service_status_updated)
 
-        result['instance']['datastore']['version'] = (self.instance.
-                                                      datastore_version.name)
+        result['instance']['datastore']['version'] = None
+        if self.instance.datastore_version:
+            result['instance']['datastore']['version'] = \
+                self.instance.datastore_version.name
+            result['instance']['datastore']['version_number'] = \
+                self.instance.datastore_version.version
 
         if self.instance.fault:
             result['instance']['fault'] = self._build_fault_info()
-
-        if self.instance.slaves:
-            result['instance']['replicas'] = self._build_slaves_info()
 
         if self.instance.configuration is not None:
             result['instance']['configuration'] = (self.
@@ -115,6 +148,12 @@ class InstanceDetailView(InstanceView):
             used = self.instance.volume_used
             if self.instance.volume_support:
                 result['instance']['volume']['used'] = used
+                if self.instance.volume_used_percent:
+                    result['instance']['volume']['used_percent'] = (
+                        float(self.instance.volume_used_percent))
+                if self.instance.mgr_extra_info:
+                    result['instance']['volume'].update(
+                        self.instance.mgr_extra_info)
             else:
                 # either ephemeral or root partition
                 result['instance']['local_storage'] = {'used': used}
@@ -143,15 +182,6 @@ class InstanceDetailView(InstanceView):
             "details": self.instance.fault.details,
         }
 
-    def _build_slaves_info(self):
-        data = []
-        for slave in self.instance.slaves:
-            data.append({
-                "id": slave.id,
-                "links": create_links("instances", self.req, slave.id)
-            })
-        return data
-
     def _build_configuration_info(self):
         return {
             "id": self.instance.configuration.id,
@@ -171,8 +201,11 @@ class InstancesView(object):
 
     def data(self):
         data = []
+
+        # Return instances in the order of 'created'
         # These are model instances
-        for instance in self.instances:
+        for instance in sorted(self.instances, key=lambda ins: ins.created,
+                               reverse=True):
             data.append(self.data_for_instance(instance))
         return {'instances': data}
 
@@ -216,7 +249,7 @@ class GuestLogsView(object):
         self.guest_logs = guest_logs
 
     def data(self):
-        return [GuestLogView(l).data() for l in self.guest_logs]
+        return [GuestLogView(guestlog).data() for guestlog in self.guest_logs]
 
 
 def convert_instance_count_to_list(instance_count):

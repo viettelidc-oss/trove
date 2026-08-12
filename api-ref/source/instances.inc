@@ -38,9 +38,14 @@ List database instances(admin)
 
 .. rest_method::  GET /v1.0/{project_id}/mgmt/instances
 
-Admin only API. Get all the instances, supported filters: deleted,
-include_clustered. Could show more information such as Cinder volume ID, Nova
-server information, etc.
+Admin only API. Get all the instances, Could show more information such as
+Cinder volume ID, Nova server information, etc.
+
+Supported filters:
+
+* ``deleted``.
+* ``include_clustered``.
+* ``project_id``: Get instances of a speficied project.
 
 Normal response codes: 200
 
@@ -87,11 +92,15 @@ Create database instance
 
 Creates a database instance.
 
-Asynchronously provisions a database instance. You must specify a flavor ID, a
-volume size and the tenant network ID. The service provisions the instance with
-a volume of the requested size, which serves as storage for the database
-instance. The database service can only be access within the tenant network,
-unless the ``access`` parameter is defined.
+Normally, you must specify a flavor ID, a volume size and the network the
+instance is attached to. The service provisions the instance with a volume of
+the requested size, which serves as storage for the database instance.
+
+If creating replica (a secondary instance of the replication cluster), flavor
+and volume size are not needed.
+
+The database service can only be access within the tenant network, unless the
+``access`` parameter is defined.
 
 Normal response codes: 200
 
@@ -110,6 +119,7 @@ Request
     - datastore: datastore1
     - datastore.type: datastore_type
     - datastore.version: datastore_version
+    - datastore.version_number: version_number
     - name: instanceName1
     - flavorRef: flavorRef
     - volume: volume
@@ -150,6 +160,7 @@ Response Parameters
    - id: instanceId1
    - name: instanceName1
    - status: instance_status
+   - operating_status: operating_status
    - links: instance_links
    - links.href: instance_link_href
    - links.rel: instance_link_rel
@@ -161,39 +172,15 @@ Response Parameters
    - datastore: datastore2
    - datastore.type: datastore_type
    - datastore.version: datastore_version1
-   - region: region_name2
-   - tenant_id: tenant_id
+   - datastore.version_number: version_number
    - volume: volume
    - volume.size: volume_size
    - volume.used: volume_used
-   - hostname: instance_hostname
-   - ip: instance_ip_address
    - created: created
    - updated: updated
    - service_status_updated: service_status_updated
-   - fault: instance_fault
-   - fault.message: instance_fault_message
-   - fault.created: instance_fault_created
-   - fault.details: instance_fault_details
-   - replicas: instance_replicas
-   - replicas.id: instance_replica_id
-   - replicas.links: instance_replica_links
-   - replicas.links.href: instance_replica_link_href
-   - replicas.links.rel: instance_replica_link_rel
-   - configuration: configuration1
-   - configuration.id: configuration_id
-   - configuration.name: configuration_name
-   - configuration.links: configuration_links
-   - configuration.links.href: configuration_link_href
-   - configuration.links.rel: configuration_link_rel
    - locality: locality
-   - local_storage_used: local_storage_used
    - password: root_password
-   - cluster_id: cluster_id
-   - shard_id: shard_id
-   - server_id: server_id
-   - volume_id: volume_id
-   - encrypted_rpc_messaging: encrypted_rpc_messaging
    - instance: instance
 
 
@@ -229,6 +216,70 @@ Request
 
    - project_id: project_id
    - instanceId: instanceId
+
+
+Response Parameters
+-------------------
+
+.. rest_parameters:: parameters.yaml
+
+   - instance: instance
+   - id: instanceId1
+   - name: instanceName1
+   - status: instance_status
+   - operating_status: operating_status
+   - links: instance_links
+   - links.href: instance_link_href
+   - links.rel: instance_link_rel
+   - flavor: flavor
+   - flavor.id: flavorId1
+   - flavor.links: flavor_links
+   - flavor.links.href: flavor_link_href
+   - flavor.links.rel: flavor_link_rel
+   - datastore: datastore2
+   - datastore.type: datastore_type
+   - datastore.version: datastore_version1
+   - region: region_name2
+   - tenant_id: tenant_id
+   - volume: volume
+   - volume.size: volume_size
+   - volume.used: volume_used
+   - volume.used_percent: volume_used_percent
+   - volume.wal_size: wal_size
+   - volume.wal_archive_size: wal_archive_size
+   - hostname: instance_hostname
+   - ip: instance_ip_address
+   - addresses: instance_ip_addresses
+   - created: created
+   - updated: updated
+   - service_status_updated: service_status_updated
+   - fault: instance_fault
+   - fault.message: instance_fault_message
+   - fault.created: instance_fault_created
+   - fault.details: instance_fault_details
+   - replicas: instance_replicas
+   - replicas.id: instance_replica_id
+   - replicas.links: instance_replica_links
+   - replicas.links.href: instance_replica_link_href
+   - replicas.links.rel: instance_replica_link_rel
+   - replica_of: replica_of_optional
+   - configuration: configuration1
+   - configuration.id: configuration_id
+   - configuration.name: configuration_name
+   - configuration.links: configuration_links
+   - configuration.links.href: configuration_link_href
+   - configuration.links.rel: configuration_link_rel
+   - locality: locality
+   - local_storage_used: local_storage_used
+   - password: root_password
+   - cluster_id: cluster_id
+   - shard_id: shard_id
+   - server_id: server_id
+   - volume_id: volume_id
+   - encrypted_rpc_messaging: encrypted_rpc_messaging
+   - access: access
+   - access.is_public: access_is_public
+   - access.allowed_cidrs: access_allowed_cidrs
 
 
 Response Example
@@ -268,14 +319,12 @@ Response Example
 
 
 
-Attach/Detach configuration group
+Attach configuration group
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. rest_method::  PUT /v1.0/{project_id}/instances/{instanceId}
 
-Attach or detach a configuration group for an instance. When you pass in only
-an instance ID and omit the configuration ID, this operation detaches any
-configuration group that was attached to the instance.
+Attach a configuration group for an instance.
 
 Normal response codes: 202
 
@@ -297,10 +346,43 @@ Request Example
 
 
 
+Detach configuration group
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. rest_method::  PUT /v1.0/{project_id}/instances/{instanceId}
+
+Detach a configuration group from an instance. When you pass in only
+an instance ID and omit the configuration ID or explicitly set
+``"configuration_id": null``, this operation detaches any configuration group
+that was attached to the instance.
+
+Normal response codes: 202
+
+Request
+-------
+
+.. rest_parameters:: parameters.yaml
+
+   - project_id: project_id
+   - instanceId: instanceId
+   - configuration: configuration_detach
+
+Request Examples
+----------------
+
+.. literalinclude:: samples/instance-put-detach-config-group-request.json
+   :language: javascript
+
+.. literalinclude:: samples/instance-put-detach-config-group-request-2.json
+   :language: javascript
+
+
+
+
 Update instance name
 ~~~~~~~~~~~~~~~~~~~~
 
-.. rest_method::  PATCH /v1.0/{project_id}/instances/{instanceId}
+.. rest_method::  PUT /v1.0/{project_id}/instances/{instanceId}
 
 Update the instance name.
 
@@ -328,7 +410,7 @@ Request Example
 Upgrade datastore version for instance
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. rest_method::  PATCH /v1.0/{project_id}/instances/{instanceId}
+.. rest_method::  PUT /v1.0/{project_id}/instances/{instanceId}
 
 Upgrade datastore version.
 
@@ -360,7 +442,7 @@ Request Example
 Detach replica
 ~~~~~~~~~~~~~~
 
-.. rest_method::  PATCH /v1.0/{project_id}/instances/{instanceId}
+.. rest_method::  PUT /v1.0/{project_id}/instances/{instanceId}
 
 Detaches a replica from its replication source.
 
@@ -391,6 +473,38 @@ Request Example
    :language: javascript
 
 
+
+Update instance accessbility
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. rest_method::  PUT /v1.0/{project_id}/instances/{instanceId}
+
+The following operations are supported:
+
+* If the instance should be exposed to public or not. Not providing
+  ``is_public`` means private.
+* The list of CIDRs that are allowed to access the database service. Not
+  providing ``allowed_cidrs`` means allowing everything.
+
+Normal response codes: 202
+
+Request
+-------
+
+.. rest_parameters:: parameters.yaml
+
+   - project_id: project_id
+   - instanceId: instanceId
+   - instance: instance
+   - access: access
+   - access.is_public: access_is_public
+   - access.allowed_cidrs: access_allowed_cidrs
+
+Request Example
+---------------
+
+.. literalinclude:: samples/instance-update-access-request.json
+   :language: javascript
 
 
 Delete database instance

@@ -7,20 +7,30 @@ Trove Design
 High Level description
 ======================
 
-Trove is designed to support a single-tenant database within a Nova
+Trove is designed to support multi-tenant database within a Nova
 instance. There will be no restrictions on how Nova is configured,
 since Trove interacts with other OpenStack components purely through
 the API.
 
+.. _control_plane:
+
+Control plane
+=============
+
+Trove's control plane contains 3 services:
+
+* Trove-api
+* Trove-taskmanager
+* Trove-conductor
 
 Trove-api
 =========
 
-The trove-api service provides a RESTful API that supports JSON and
-XML to provision and manage Trove instances.
+The trove-api service provides a RESTful API that supports JSON to
+provision and manage Trove instances.
 
 * A REST-ful component
-* Entry point - trove/bin/trove-api
+* Entry point - trove/cmd/api.py
 * Uses a WSGI launcher configured by etc/trove/api-paste.ini
 * Defines the pipeline of filters; authtoken, ratelimit, etc.
 * Defines the app_factory for the troveapp as
@@ -28,12 +38,14 @@ XML to provision and manage Trove instances.
 * The API class (a wsgi Router) wires the REST paths to the
   appropriate Controllers
 * Implementation of the Controllers are under the relevant module
-  (versions/instance/flavor/limits), in the service.py module
+  (versions/instance/backup/configuration), in the service.py module
 * Controllers usually redirect implementation to a class in the
   models.py module
 * At this point, an api module of another component (TaskManager,
   GuestAgent, etc.) is used to send the request onwards through
   RabbitMQ
+* Consider trove-api service to be scalable if your cluster will have
+  a big number of database api requests.
 
 
 Trove-taskmanager
@@ -44,9 +56,9 @@ provisioning instances, managing the lifecycle of instances, and
 performing operations on the Database instance.
 
 * A service that listens on a RabbitMQ topic
-* Entry point - trove/bin/trove-taskmanager
+* Entry point - trove/cmd/taskmanager.py
 * Runs as a RpcService configured by
-  etc/trove/trove.conf.sample which defines
+  etc/trove/trove.conf which defines
   trove.taskmanager.manager.Manager as the manager - basically this is
   the entry point for requests arriving through the queue
 * As described above, requests for this component are pushed to MQ
@@ -62,6 +74,40 @@ performing operations on the Database instance.
 * Actual handling is usually done in the models.py module
 
 
+Trove-conductor
+===============
+
+Conductor is a service that runs on the control plane, responsible for
+receiving messages from guest instances to update information on the
+control plane. For example, instance statuses and the current status
+of a backup. With conductor, guest instances do not need a direct
+connection to the control plane's database. Conductor listens for RPC
+messages through the message bus and performs the relevant operation.
+
+* Similar to guest-agent in that it is a service that listens to a
+  RabbitMQ topic. The difference is conductor lives on the control
+  plane, not the guest.
+* Guest agents communicate to conductor by putting messages on the
+  topic defined in cfg as conductor_queue. By default this is
+  "trove-conductor".
+* Entry point - trove/cmd/conductor.py
+* Runs as RpcService configured by
+  etc/trove/trove.conf which defines
+  trove.conductor.manager.Manager as the manager. This is the entry
+  point for requests arriving on the queue.
+* As guestagent above, requests are pushed to MQ from another component
+  using _cast() (synchronous), generally of the form
+  {"method": "<method_name>", "args": {<arguments>}}
+* Actual database update work is done by trove/conductor/manager.py
+* The "heartbeat" method updates the status of an instance. This is
+  used to report that instance has changed from NEW to BUILDING to
+  ACTIVE and so on.
+* The "update_backup" method changes the details of a backup, including
+  its current status, size of the backup, type, and checksum.
+* Consider conductor service to be scalable; it will require more
+  resources as number of working trove instances will grow.
+
+
 Trove-guestagent
 ================
 
@@ -74,9 +120,9 @@ bus and performs the requested operation.
   listens on a RabbitMQ topic
 * GuestAgent runs on every DB instance, and a dedicated MQ topic is
   used (identified as the instance's id)
-* Entry point - trove/bin/trove-guestagent
+* Entry point - trove/cmd/guest.py
 * Runs as a RpcService configured by
-  etc/trove/trove-guestagent.conf.sample which defines
+  /etc/trove/conf.d/trove-guestagent.conf which defines
   trove.guestagent.datastore.manager.Manager as the manager - basically
   this is the entry point for requests arriving through the queue
 * As described above, requests for this component are pushed to MQ
@@ -88,40 +134,8 @@ bus and performs the requested operation.
   by some equivalent to reflection
 * The Manager then redirect the handling to an object (usually) from
   the dbaas.py module.
-* Actual handling is usually done in the dbaas.py module
-
-
-Trove-conductor
-===============
-
-Conductor is a service that runs on the host, responsible for receiving
-messages from guest instances to update information on the host.
-For example, instance statuses and the current status of a backup.
-With conductor, guest instances do not need a direct connection to the
-host's database. Conductor listens for RPC messages through the message
-bus and performs the relevant operation.
-
-* Similar to guest-agent in that it is a service that listens to a
-  RabbitMQ topic. The difference is conductor lives on the host, not
-  the guest.
-* Guest agents communicate to conductor by putting messages on the
-  topic defined in cfg as conductor_queue. By default this is
-  "trove-conductor".
-* Entry point - trove/bin/trove-conductor
-* Runs as RpcService configured by
-  etc/trove/trove.conf.sample which defines
-  trove.conductor.manager.Manager as the manager. This is the entry
-  point for requests arriving on the queue.
-* As guestagent above, requests are pushed to MQ from another component
-  using _cast() (synchronous), generally of the form
-  {"method": "<method_name>", "args": {<arguments>}}
-* Actual database update work is done by trove/conductor/manager.py
-* The "heartbeat" method updates the status of an instance. This is
-  used to report that instance has changed from NEW to BUILDING to
-  ACTIVE and so on.
-* The "update_backup" method changes the details of a backup, including
-  its current status, size of the backup, type, and checksum.
-
+* The database service is running as a docker container inside the Nova
+  VM.
 
 
 .. Trove - Database as a Service: https://wiki.openstack.org/wiki/Trove

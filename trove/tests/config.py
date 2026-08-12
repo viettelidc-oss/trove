@@ -21,7 +21,7 @@ environments if we choose to.
 
 """
 
-from collections import Mapping
+from collections.abc import Mapping
 from datetime import datetime
 import json
 import os
@@ -98,7 +98,6 @@ class TestConfig(object):
                     "valid_values": {
                         "connect_timeout": 120,
                         "local_infile": 0,
-                        "collation_server": "latin1_swedish_ci"
                     },
                     "appending_values": {
                         "join_buffer_size": 1048576,

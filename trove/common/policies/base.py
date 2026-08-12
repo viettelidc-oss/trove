@@ -12,6 +12,8 @@
 
 from oslo_policy import policy
 
+ADMIN_CTX_POLICY = 'context_is_admin'
+
 PATH_BASE = '/v1.0/{account_id}'
 
 PATH_INSTANCES = PATH_BASE + '/instances'
@@ -33,6 +35,8 @@ PATH_CLUSTER_INSTANCE = PATH_CLUSTER_INSTANCES + '/{instance}'
 PATH_BACKUPS = PATH_BASE + '/backups'
 PATH_BACKUP = PATH_BACKUPS + '/{backup}'
 
+PATH_BACKUP_STRATEGIES = PATH_BASE + '/backup_strategies'
+
 PATH_CONFIGS = PATH_BASE + '/configurations'
 PATH_CONFIG = PATH_CONFIGS + '/{config}'
 
@@ -50,12 +54,16 @@ PATH_MODULE = PATH_MODULES + '/{module}'
 
 rules = [
     policy.RuleDefault(
+        ADMIN_CTX_POLICY,
+        'role:admin',
+        description='Rule for cloud admin access'),
+    policy.RuleDefault(
         'admin',
         'role:admin or is_admin:True',
         description='Must be an administrator.'),
     policy.RuleDefault(
         'admin_or_owner',
-        'rule:admin or tenant:%(tenant)s',
+        'rule:admin or project_id:%(tenant)s',
         description='Must be an administrator or owner of the object.'),
     policy.RuleDefault(
         'default',

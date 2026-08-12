@@ -2,6 +2,11 @@
 Upgrade cluster datastore
 =========================
 
+.. caution::
+
+   Database clustering function is still in experimental, should not be used
+   in production environment.
+
 Upgrading datastore for cluster instances is very similar to upgrading
 a single instance.
 
@@ -27,7 +32,7 @@ Upgrading cluster
 
    .. code-block:: console
 
-      $openstack database cluster list
+       $ openstack database cluster list
        +--------------------------------------+---------------+-----------+-------------------+-----------+
        | ID                                   | Name          | Datastore | Datastore Version | Task Name |
        +--------------------------------------+---------------+-----------+-------------------+-----------+
@@ -41,7 +46,7 @@ Upgrading cluster
 
    .. code-block:: console
 
-      $openstack datastore version list redis
+       $ openstack datastore version list redis
        +--------------------------------------+-------+
        | ID                                   | Name  |
        +--------------------------------------+-------+
@@ -56,7 +61,7 @@ Upgrading cluster
 
    .. code-block:: console
 
-      $openstack database cluster upgrade 05f2e7b7-8dac-453f-ad5d-38195cd5718f 3.2.7
+      $ openstack database cluster upgrade 05f2e7b7-8dac-453f-ad5d-38195cd5718f 3.2.7
 
 #. **Wait until task changes from UPGRADING_CLUSTER to NONE**
 
@@ -65,7 +70,7 @@ Upgrading cluster
 
    .. code-block:: console
 
-      $openstack database cluster list
+       $ openstack database cluster list
        +--------------------------------------+---------------+-----------+-------------------+-----------+
        | ID                                   | Name          | Datastore | Datastore Version | Task Name |
        +--------------------------------------+---------------+-----------+-------------------+-----------+

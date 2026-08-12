@@ -20,7 +20,7 @@ import eventlet
 from oslo_log import log as logging
 
 from trove.common import exception as rd_exception
-from trove.common import instance as rd_instance
+from trove.instance import service_status as srvstatus
 from trove.tests.util import unquote_user_host
 
 DB = {}
@@ -92,9 +92,9 @@ class FakeGuest(object):
         LOG.debug("Updating attributes")
         self._check_username(username)
         if (username, hostname) not in self.users:
-                raise rd_exception.UserNotFound(
-                    "User %s@%s cannot be found on the instance."
-                    % (username, hostname))
+            raise rd_exception.UserNotFound(
+                "User %s@%s cannot be found on the instance."
+                % (username, hostname))
         new_name = user_attrs.get('name')
         new_host = user_attrs.get('host')
         new_password = user_attrs.get('password')
@@ -236,9 +236,9 @@ class FakeGuest(object):
         def update_db():
             status = InstanceServiceStatus.find_by(instance_id=self.id)
             if instance_name.endswith('GUEST_ERROR'):
-                status.status = rd_instance.ServiceStatuses.FAILED
+                status.status = srvstatus.ServiceStatuses.FAILED
             else:
-                status.status = rd_instance.ServiceStatuses.HEALTHY
+                status.status = srvstatus.ServiceStatuses.HEALTHY
             status.save()
             AgentHeartBeat.create(instance_id=self.id)
         eventlet.spawn_after(3.5, update_db)
@@ -246,8 +246,8 @@ class FakeGuest(object):
     def _set_task_status(self, new_status='HEALTHY'):
         from trove.instance.models import InstanceServiceStatus
         print("Setting status to %s" % new_status)
-        states = {'HEALTHY': rd_instance.ServiceStatuses.HEALTHY,
-                  'SHUTDOWN': rd_instance.ServiceStatuses.SHUTDOWN,
+        states = {'HEALTHY': srvstatus.ServiceStatuses.HEALTHY,
+                  'SHUTDOWN': srvstatus.ServiceStatuses.SHUTDOWN,
                   }
         status = InstanceServiceStatus.find_by(instance_id=self.id)
         status.status = states[new_status]
@@ -265,11 +265,11 @@ class FakeGuest(object):
         # There's nothing to do here, since there is no config to update.
         pass
 
-    def start_db_with_conf_changes(self, config_contents):
+    def start_db_with_conf_changes(self, config_contents, ds_version):
         time.sleep(2)
         self._set_task_status('HEALTHY')
 
-    def stop_db(self, do_not_start_on_reboot=False):
+    def stop_db(self):
         self._set_task_status('SHUTDOWN')
 
     def get_volume_info(self):
@@ -330,7 +330,7 @@ class FakeGuest(object):
     def unmount_volume(self, device_path=None, mount_point=None):
         pass
 
-    def resize_fs(self, device_path=None, mount_point=None):
+    def resize_fs(self, device_path=None, mount_point=None, online=False):
         pass
 
     def update_overrides(self, overrides, remove=False):

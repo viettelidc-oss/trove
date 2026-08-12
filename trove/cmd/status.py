@@ -15,6 +15,7 @@
 import sys
 
 from oslo_config import cfg
+from oslo_upgradecheck import common_checks
 from oslo_upgradecheck import upgradecheck
 
 from trove.common.i18n import _
@@ -38,12 +39,12 @@ class Checks(upgradecheck.UpgradeCommands):
         """
 
         db_api = db.get_db_api()
-        db_api.configure_db(cfg.CONF)
+        db_api.configure_db()
 
-        query = DBInstance.query()
-        query = query.filter(DBInstance.task_status != InstanceTasks.NONE)
-        query = query.filter_by(deleted=False)
-        instances_with_tasks = query.count()
+        with DBInstance.query() as query:
+            query = query.filter(DBInstance.task_status != InstanceTasks.NONE)
+            query = query.filter_by(deleted=False)
+            instances_with_tasks = query.count()
 
         if instances_with_tasks:
             return upgradecheck.Result(
@@ -62,6 +63,8 @@ class Checks(upgradecheck.UpgradeCommands):
     _upgrade_checks = (
         (_("instances_with_running_tasks"),
          _check_instances_with_running_tasks),
+        (_('policy File JSON to YAML Migration'),
+         (common_checks.check_policy_json, {'conf': cfg.CONF})),
     )
 
 
